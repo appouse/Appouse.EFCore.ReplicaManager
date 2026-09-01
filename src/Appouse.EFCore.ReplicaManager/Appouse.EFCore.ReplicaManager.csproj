@@ -1,0 +1,70 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>Appouse.EFCore.ReplicaManager</RootNamespace>
+    <AssemblyName>Appouse.EFCore.ReplicaManager</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Every public member must be documented; CS1591 is promoted so the compiler enforces it
+         rather than code review. Deliberately narrower than TreatWarningsAsErrors, which would
+         break the build whenever a future SDK introduces a new warning. -->
+    <WarningsAsErrors>$(WarningsAsErrors);CS1591</WarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <PackageId>Appouse.EFCore.ReplicaManager</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Appouse</Authors>
+    <Company>Appouse</Company>
+    <Product>Appouse.EFCore.ReplicaManager</Product>
+    <Description>Transparent Read/Write (Master/Replica) database splitting for EF Core 8+. Routes HTTP GET requests to a read replica and writes to the master, with [UseReadDb]/[UseWriteDb] attributes for explicit control and an HttpContext-free scope API for background workers, Hangfire and Quartz. Provider agnostic: SQL Server, PostgreSQL, MySQL and others.</Description>
+    <PackageTags>efcore;entity-framework;entity-framework-core;read-replica;read-write-splitting;master-slave;cqrs;sqlserver;postgresql;mysql;scalability</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/appouse/Appouse.EFCore.ReplicaManager</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/appouse/Appouse.EFCore.ReplicaManager</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- Gated on CI: unconditionally true would normalise source paths on developer machines and
+         break stepping into this code during local debugging. -->
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- SourceLink is in-box from the .NET 8 SDK onwards. Adding Microsoft.SourceLink.GitHub here
+         would set SuppressImplicitGitSourceLink and actively disable it. -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lowest supported version, written plainly. NuGet reads "8.0.0" as ">= 8.0.0, nearest wins",
+         so EF Core 9 and 10 consumers resolve their own version with no warning. A hard pin
+         ("[8.0.0]") would raise NU1608 for every one of them. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="8.0.0" />
+    <!-- Declared explicitly even though the framework reference below satisfies them at compile
+         time: the ASP.NET Core ref pack shadows the NuGet graph, so an API resolved only from it
+         would be missing from the produced .nuspec and would throw FileNotFoundException for a
+         non-web consumer. -->
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- PrivateAssets="all" is load-bearing. Without it the framework reference is written into the
+         .nuspec and flows to every consumer: a Worker Service on a runtime-only image then fails to
+         start with "Framework: Microsoft.AspNetCore.App ... No frameworks were found", before any
+         user code runs. With it, non-web consumers build and run normally, and the MVC types are
+         only ever resolved by web applications that already have the shared framework. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>
