@@ -6,3 +6,4 @@ artifacts/
 .vs/
 .idea/
 .DS_Store
+.env

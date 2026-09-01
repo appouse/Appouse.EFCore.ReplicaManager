@@ -221,6 +221,66 @@ using (dbTarget.UseMasterDb())
 
 ---
 
+## Database providers
+
+The package never names a provider type. Its entire provider-facing surface is four members declared
+on the ADO.NET base class — `DbConnection.State`, `DbConnection.ConnectionString`, `Open`/`OpenAsync`
+and `Close` — so any EF Core relational provider works.
+
+| Provider | Package | Verified |
+|---|---|---|
+| SQL Server | `Microsoft.EntityFrameworkCore.SqlServer` | ✔ |
+| PostgreSQL | `Npgsql.EntityFrameworkCore.PostgreSQL` | ✔ |
+| MySQL / MariaDB | `Pomelo.EntityFrameworkCore.MySql` | ✔ |
+| Oracle | `Oracle.EntityFrameworkCore` | ✔ |
+| SQLite | `Microsoft.EntityFrameworkCore.Sqlite` | ✔ |
+
+*Verified* means the test suite runs the routing and failover paths against each provider's real
+connection and exception types: connection-string reassignment on a closed connection, the failover
+loop visiting every replica, and the fallback handing the operation back to EF Core. A live server is
+only needed to prove that a successful open succeeds, which is ordinary provider behaviour.
+
+```csharp
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseSqlServer(cs));
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseNpgsql(cs));
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseOracle(cs));
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseSqlite(cs));
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
+    options.UseMySql(cs, new MySqlServerVersion(new Version(8, 0, 34))));
+```
+
+### Provider notes
+
+**MySQL — do not use `ServerVersion.AutoDetect`.** It opens a connection while the service provider
+is being built, so application start-up would depend on the master being reachable, before any
+routing exists. Pass an explicit `MySqlServerVersion` as above.
+
+**SQL Server — mark the replica connection strings read-only.** When the replicas are Always On
+secondaries, add `ApplicationIntent=ReadOnly` to each replica connection string so the listener
+routes to a readable secondary. The master connection string must not carry it.
+
+**PostgreSQL — Npgsql's multi-host support is complementary, not redundant.** Npgsql can take
+`Host=h1,h2,h3` with `Target Session Attributes=prefer-standby` and `Load Balance Hosts=true` and do
+its own connection-level balancing. That still cannot know a `GET` from a `POST`, which is what this
+package decides. Use either style: several `ReplicaConnectionStrings` entries, or one multi-host
+replica string — or both.
+
+**Oracle — an Active Data Guard standby is read-only.** It works as a replica; writes must reach the
+primary, which the routing rules already guarantee.
+
+**SQLite has no replication.** It is genuinely useful for tests — the suite in this repository routes
+between two real SQLite files to prove which database served a query — but it is not a production
+topology.
+
+**All providers: each connection string gets its own ADO.NET connection pool.** A master plus three
+replicas is four pools, each with its own `Max Pool Size`. Size them for the traffic each node
+actually takes rather than copying one number across all four.
+
+**All providers: the model is built from the master connection string.** Replicas must expose the
+same schema. EF Core builds one model, and migrations run against the master.
+
+---
+
 ## Registering the DbContext
 
 | Registration | Result |
