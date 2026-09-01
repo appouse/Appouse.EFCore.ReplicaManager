@@ -95,6 +95,34 @@ What happens, in order:
 Writes are never failed over, because there is only one master to write to. Retries there are left
 to EF Core's own execution strategy.
 
+### The one case failover cannot cover on its own
+
+Opening a connection is not the same as reaching a server. ADO.NET pools connections, so when a
+replica dies while the pool still holds warm handles to it, `OpenAsync` hands one back **without a
+network round trip and reports success**. The socket is dead, but nothing discovers that until the
+first command runs — long after the routing decision, and far too late to pick a different replica
+for that attempt.
+
+The package does two things about it, and asks one thing of you:
+
+* A command failing on a connection routed to a replica marks that replica down immediately, so the
+  *next* request avoids it instead of drawing another dead handle from the same pool.
+* It does not retry the failed command itself. That is EF Core's execution strategy's job.
+* **Enable that strategy.** It composes exactly as you would hope: the retry opens a fresh
+  connection, which routes to a replica already marked down.
+
+```csharp
+builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
+    options.UseNpgsql(cs, npgsql => npgsql.EnableRetryOnFailure(maxRetryCount: 5)));
+```
+
+With retry enabled, a replica outage is invisible to application code. Without it, the first request
+after the outage surfaces one connection error before traffic settles on the survivor. Both
+behaviours are covered by the live tests.
+
+`ReplicaUnavailableException` is deliberately not a transient error: it means every replica was
+dialled and refused, so retrying cannot help until one comes back.
+
 Swap the strategy for weighted, latency-aware or locality-aware selection:
 
 ```csharp
@@ -227,7 +255,7 @@ The package never names a provider type. Its entire provider-facing surface is f
 on the ADO.NET base class — `DbConnection.State`, `DbConnection.ConnectionString`, `Open`/`OpenAsync`
 and `Close` — so any EF Core relational provider works.
 
-| Provider | Package | Verified |
+| Provider | Package | Verified against a live server |
 |---|---|---|
 | SQL Server | `Microsoft.EntityFrameworkCore.SqlServer` | ✔ |
 | PostgreSQL | `Npgsql.EntityFrameworkCore.PostgreSQL` | ✔ |
@@ -235,10 +263,17 @@ and `Close` — so any EF Core relational provider works.
 | Oracle | `Oracle.EntityFrameworkCore` | ✔ |
 | SQLite | `Microsoft.EntityFrameworkCore.Sqlite` | ✔ |
 
-*Verified* means the test suite runs the routing and failover paths against each provider's real
-connection and exception types: connection-string reassignment on a closed connection, the failover
-loop visiting every replica, and the fallback handing the operation back to EF Core. A live server is
-only needed to prove that a successful open succeeds, which is ordinary provider behaviour.
+Every one of these runs against three real database servers — one master and two replicas, each
+holding a different marker row so a test can tell which one answered. The integration suite starts
+them in containers, proves that reads land on a replica and writes on the master, then **stops a
+replica's container mid-test** and proves reads keep being served by the survivor, that a total
+outage falls back to the master, and that a recovered node is used again once its cooldown expires.
+
+```bash
+dotnet test tests/Appouse.EFCore.ReplicaManager.IntegrationTests   # needs Docker
+```
+
+Without Docker those tests skip themselves rather than fail.
 
 ```csharp
 builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseSqlServer(cs));
@@ -266,7 +301,15 @@ package decides. Use either style: several `ReplicaConnectionStrings` entries, o
 replica string — or both.
 
 **Oracle — an Active Data Guard standby is read-only.** It works as a replica; writes must reach the
-primary, which the routing rules already guarantee.
+primary, which the routing rules already guarantee. Note that Oracle's EF Core provider ships **no
+`EnableRetryOnFailure`**, unlike the other three, so transparent recovery from a warm-pool outage
+needs an execution strategy of your own:
+
+```csharp
+options.UseOracle(cs, oracle => oracle.ExecutionStrategy(d => new MyRetryingExecutionStrategy(d)));
+```
+
+`tests/Appouse.EFCore.ReplicaManager.IntegrationTests/OracleCluster.cs` has a working one to copy.
 
 **SQLite has no replication.** It is genuinely useful for tests — the suite in this repository routes
 between two real SQLite files to prove which database served a query — but it is not a production

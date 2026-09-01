@@ -97,6 +97,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
     private readonly ILogger<MasterReplicaDbInterceptor> _logger;
     private readonly MasterReplicaOptions _options;
     private readonly IDbConnectionStringResolver _resolver;
+    private readonly ConnectionRouteRegistry _routes;
     private readonly IReplicaSelector _selector;
     private readonly IDbTargetContext _targetContext;
 
@@ -120,6 +121,14 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
     /// Tracks which replicas recently refused a connection.
     /// <para>TR: Hangi replica'ların yakın zamanda bağlantıyı reddettiğini izler.</para>
     /// </param>
+    /// <param name="routes">
+    /// Records which replica each connection was routed to, so a failure that only surfaces while a
+    /// command runs can still be attributed to the right node.
+    /// <para>
+    /// TR: Her bağlantının hangi replica'ya yönlendirildiğini kaydeder; böylece yalnızca komut
+    /// çalışırken yüzeye çıkan bir hata da doğru düğüme atfedilebilir.
+    /// </para>
+    /// </param>
     /// <param name="options">
     /// The configured master/replica options.
     /// <para>TR: Yapılandırılmış master/replica ayarları.</para>
@@ -137,6 +146,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
         IDbConnectionStringResolver resolver,
         IReplicaSelector selector,
         IReplicaHealthMonitor health,
+        ConnectionRouteRegistry routes,
         IOptions<MasterReplicaOptions> options,
         ILogger<MasterReplicaDbInterceptor> logger)
     {
@@ -144,6 +154,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
         ArgumentNullException.ThrowIfNull(resolver);
         ArgumentNullException.ThrowIfNull(selector);
         ArgumentNullException.ThrowIfNull(health);
+        ArgumentNullException.ThrowIfNull(routes);
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -151,6 +162,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
         _resolver = resolver;
         _selector = selector;
         _health = health;
+        _routes = routes;
         _options = options.Value;
         _logger = logger;
     }
@@ -190,6 +202,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
                 connection.ConnectionString = replicas[index];
                 connection.Open();
                 _health.ReportSuccess(index);
+                _routes.RecordReplica(connection, index);
                 Log.OpenedReplica(_logger, eventData.ConnectionId, index);
 
                 // EF Core must not open it a second time.
@@ -244,6 +257,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
                 connection.ConnectionString = replicas[index];
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
                 _health.ReportSuccess(index);
+                _routes.RecordReplica(connection, index);
                 Log.OpenedReplica(_logger, eventData.ConnectionId, index);
 
                 return InterceptionResult.Suppress();
@@ -384,6 +398,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
             connection.ConnectionString = connectionString;
         }
 
+        _routes.RecordMaster(connection);
         Log.RoutedToMaster(_logger, eventData.ConnectionId);
     }
 

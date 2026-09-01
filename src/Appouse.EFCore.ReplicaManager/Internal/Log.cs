@@ -68,6 +68,12 @@ internal static partial class Log
     internal static partial void FallingBackToMaster(ILogger logger, int replicaCount, Guid connectionId);
 
     [LoggerMessage(
+        EventId = 1009,
+        Level = LogLevel.Warning,
+        Message = "A command failed on a connection routed to replica #{ReplicaIndex}; standing that replica down so the next request avoids it.")]
+    internal static partial void ReplicaCommandFailed(ILogger logger, int replicaIndex, Exception exception);
+
+    [LoggerMessage(
         EventId = 1008,
         Level = LogLevel.Warning,
         Message = "A replica was requested for connection {ConnectionId} but none is configured; falling back to the master.")]

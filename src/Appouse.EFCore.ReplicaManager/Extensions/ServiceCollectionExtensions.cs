@@ -394,6 +394,7 @@ public static class ReplicaManagerServiceCollectionExtensions
         services.TryAddSingleton<IReplicaSelector, RoundRobinReplicaSelector>();
         services.TryAddSingleton<IDbConnectionStringResolver, DbConnectionStringResolver>();
         services.TryAddSingleton<IReplicaHealthMonitor, ReplicaHealthMonitor>();
+        services.TryAddSingleton<ConnectionRouteRegistry>();
 
         // Registered through an explicit factory because DbTargetContext offers two single-argument
         // constructors, and the container must not have to guess between them.
@@ -402,6 +403,7 @@ public static class ReplicaManagerServiceCollectionExtensions
 
         services.TryAddSingleton<MasterReplicaDbInterceptor>();
         services.TryAddSingleton<MasterStickinessSaveChangesInterceptor>();
+        services.TryAddSingleton<ReplicaCommandFailureInterceptor>();
 
         return services;
     }

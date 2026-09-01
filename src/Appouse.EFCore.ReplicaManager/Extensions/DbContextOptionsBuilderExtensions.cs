@@ -60,7 +60,8 @@ public static class ReplicaManagerDbContextOptionsBuilderExtensions
 
         return builder.AddInterceptors(
             serviceProvider.GetRequiredService<MasterReplicaDbInterceptor>(),
-            serviceProvider.GetRequiredService<MasterStickinessSaveChangesInterceptor>());
+            serviceProvider.GetRequiredService<MasterStickinessSaveChangesInterceptor>(),
+            serviceProvider.GetRequiredService<ReplicaCommandFailureInterceptor>());
     }
 
     /// <summary>
