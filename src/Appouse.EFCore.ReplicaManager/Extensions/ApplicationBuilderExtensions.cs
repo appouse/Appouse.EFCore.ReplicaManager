@@ -1,5 +1,6 @@
 using System;
 using Appouse.EFCore.ReplicaManager;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Microsoft.AspNetCore.Builder;
 
@@ -49,6 +50,14 @@ public static class ReplicaManagerApplicationBuilderExtensions
     public static IApplicationBuilder UseDbTargetRouting(this IApplicationBuilder app)
     {
         ArgumentNullException.ThrowIfNull(app);
+
+        // Tells start-up validation that this application routes through the middleware, so it does
+        // not warn about the MVC filter being absent.
+        if (app.ApplicationServices.GetService<DbTargetRoutingMarker>() is { } marker)
+        {
+            marker.MiddlewareRegistered = true;
+        }
+
         return app.UseMiddleware<DbTargetMiddleware>();
     }
 }

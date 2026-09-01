@@ -68,6 +68,12 @@ internal static partial class Log
     internal static partial void FallingBackToMaster(ILogger logger, int replicaCount, Guid connectionId);
 
     [LoggerMessage(
+        EventId = 1010,
+        Level = LogLevel.Warning,
+        Message = "Controllers are registered but neither services.AddDbTargetMvcFilter() nor app.UseDbTargetRouting() was called, so no request is routed by attribute or HTTP verb and every action falls back to the configured default target. Add one of them, or set MasterReplicaOptions.ValidateStartupWiring to false if routing only through UseTarget scopes is intended.")]
+    internal static partial void MvcRoutingNotWired(ILogger logger);
+
+    [LoggerMessage(
         EventId = 1009,
         Level = LogLevel.Warning,
         Message = "A command failed on a connection routed to replica #{ReplicaIndex}; standing that replica down so the next request avoids it.")]

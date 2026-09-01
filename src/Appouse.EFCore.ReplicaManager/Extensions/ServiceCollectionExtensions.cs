@@ -1,8 +1,11 @@
 using System;
 using Appouse.EFCore.ReplicaManager;
 using Microsoft.EntityFrameworkCore;
+using Appouse.EFCore.ReplicaManager.Internal;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Microsoft.Extensions.DependencyInjection;
@@ -404,6 +407,19 @@ public static class ReplicaManagerServiceCollectionExtensions
         services.TryAddSingleton<MasterReplicaDbInterceptor>();
         services.TryAddSingleton<MasterStickinessSaveChangesInterceptor>();
         services.TryAddSingleton<ReplicaCommandFailureInterceptor>();
+
+        // Turns the package's two silent misconfigurations - a DbContext registered without the
+        // interceptors, and controllers registered without any routing - into a start-up failure and
+        // a start-up warning respectively. The service collection is captured rather than snapshotted
+        // because contexts are usually registered after this call.
+        var marker = DbTargetRoutingMarker.GetOrAdd(services);
+        services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, StartupWiringValidator>(
+            serviceProvider => new StartupWiringValidator(
+                services,
+                serviceProvider,
+                marker,
+                serviceProvider.GetRequiredService<IOptions<MasterReplicaOptions>>(),
+                serviceProvider.GetRequiredService<ILogger<StartupWiringValidator>>())));
 
         return services;
     }

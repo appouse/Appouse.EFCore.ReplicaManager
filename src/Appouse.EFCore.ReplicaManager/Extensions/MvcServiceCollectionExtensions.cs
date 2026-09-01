@@ -66,6 +66,8 @@ public static class ReplicaManagerMvcServiceCollectionExtensions
     {
         ArgumentNullException.ThrowIfNull(services);
 
+        DbTargetRoutingMarker.GetOrAdd(services).MvcFilterRegistered = true;
+
         services.AddOptions<MvcOptions>()
             .Configure<IOptions<MasterReplicaOptions>>((mvcOptions, masterReplicaOptions) =>
                 mvcOptions.Filters.Add<DbTargetActionFilter>(masterReplicaOptions.Value.MvcActionFilterOrder));

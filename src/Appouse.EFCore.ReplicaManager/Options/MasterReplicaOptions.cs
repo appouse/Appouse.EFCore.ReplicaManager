@@ -191,6 +191,52 @@ public sealed class MasterReplicaOptions
     public TimeSpan ReplicaFailureCooldown { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// When <see langword="true"/> (the default), the host checks at start-up that the package is
+    /// actually wired into the application, instead of silently doing nothing.
+    /// <para>
+    /// TR: <see langword="true"/> ise (varsayılan), paketin uygulamaya gerçekten bağlanmış olduğu
+    /// açılışta denetlenir; sessizce hiçbir şey yapmaması engellenir.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// Two things are checked. A registered <see cref="Microsoft.EntityFrameworkCore.DbContext"/>
+    /// without the routing interceptor throws, because the package is doing nothing at all for it.
+    /// An application that registered controllers but neither
+    /// <c>services.AddDbTargetMvcFilter()</c> nor <c>app.UseDbTargetRouting()</c> gets a warning,
+    /// because routing purely through <see cref="IDbTargetContext.UseTarget"/> scopes is a
+    /// legitimate choice. Requires an <c>IHost</c>; a bare <c>ServiceProvider</c> runs no hosted
+    /// services and so runs no checks.
+    /// <para>
+    /// TR: İki şey denetlenir. Yönlendirme interceptor'ı olmadan kaydedilmiş bir
+    /// <see cref="Microsoft.EntityFrameworkCore.DbContext"/> hata fırlatır; çünkü paket onun için
+    /// hiçbir şey yapmıyordur. Controller kaydedip ne <c>services.AddDbTargetMvcFilter()</c> ne de
+    /// <c>app.UseDbTargetRouting()</c> çağırmış bir uygulama uyarı alır; çünkü yalnızca
+    /// <see cref="IDbTargetContext.UseTarget"/> scope'larıyla yönlendirme yapmak meşru bir
+    /// tercihtir. Bir <c>IHost</c> gerektirir; çıplak bir <c>ServiceProvider</c> hosted service
+    /// çalıştırmadığı için denetim de yapmaz.
+    /// </para>
+    /// </remarks>
+    public bool ValidateStartupWiring { get; set; } = true;
+
+    /// <summary>
+    /// Context types that are deliberately left unrouted, and so must not trip
+    /// <see cref="ValidateStartupWiring"/>.
+    /// <para>
+    /// TR: Bilinçli olarak yönlendirilmemiş bırakılan ve bu yüzden
+    /// <see cref="ValidateStartupWiring"/> denetimine takılmaması gereken context türleri.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// Use it for a second context that lives on an unrelated database - an outbox, an audit log, a
+    /// job store - which has no master and no replica of its own.
+    /// <para>
+    /// TR: Kendi master'ı ve replica'sı olmayan, ilgisiz bir veritabanında yaşayan ikinci bir
+    /// context için kullanın: outbox, denetim kaydı, job deposu gibi.
+    /// </para>
+    /// </remarks>
+    public IList<Type> UnroutedDbContextTypes { get; } = new List<Type>();
+
+    /// <summary>
     /// Order given to <see cref="DbTargetActionFilter"/> when it is registered with
     /// <c>services.AddDbTargetMvcFilter()</c>. Defaults to <see cref="int.MinValue"/>.
     /// <para>

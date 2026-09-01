@@ -332,11 +332,12 @@ same schema. EF Core builds one model, and migrations run against the master.
 | `AddMasterReplicaDbContextPool<T>` | Routed; no routing state sticks to a pooled instance |
 | `AddMasterReplicaDbContextFactory<T>` | Routed; a produced context follows the flow that *uses* it |
 | `AddDbContext<T>` + `UseMasterReplicaSplitting(sp)` | Routed, identically |
-| `AddDbContext<T>` alone | **Silently not routed** |
+| `AddDbContext<T>` alone | **Not routed — the host refuses to start** |
 
-The last row is the one trap: `AddEfCoreMasterReplica` registers services but never touches a
-`DbContext` on its own, so a plain `AddDbContext` produces no error and no warning — just a context
-that ignores the ambient target. If you register it yourself, wire the interceptors in:
+`AddEfCoreMasterReplica` registers services but never touches a `DbContext` on its own, so a plain
+`AddDbContext` used to produce no error and no warning — just a context that quietly ignored the
+ambient target. That now fails at start-up instead. If you register the context yourself, wire the
+interceptors in:
 
 ```csharp
 services.AddDbContext<AppDbContext>((sp, options) =>
@@ -345,6 +346,43 @@ services.AddDbContext<AppDbContext>((sp, options) =>
     options.UseMasterReplicaSplitting(sp);
 });
 ```
+
+---
+
+## Start-up checks
+
+Two ways of wiring this package up wrongly used to produce no error at all, just an application that
+looked configured and sent every query to `DefaultTarget`. Both are now caught before the first
+request.
+
+**A `DbContext` registered without the interceptors throws.** The message names the context and both
+ways to fix it. It is an error rather than a warning because the package is doing literally nothing
+for that context.
+
+```
+Master/replica splitting is registered, but AppDbContext was registered without it, so every query
+from that context ignores the ambient target ... Register the context with
+services.AddMasterReplicaDbContext<TContext>(...), or, if you call AddDbContext yourself, add
+options.UseMasterReplicaSplitting(serviceProvider) inside it.
+```
+
+A second context that deliberately lives elsewhere — an outbox, an audit log, a job store — is
+declared rather than silenced:
+
+```csharp
+options.UnroutedDbContextTypes.Add(typeof(AuditDbContext));
+```
+
+**Controllers registered with no routing mechanism warn.** If the application called
+`AddControllers()` but neither `services.AddDbTargetMvcFilter()` nor `app.UseDbTargetRouting()`, a
+warning is logged naming both. This one is a warning rather than an error because routing purely
+through `UseTarget` scopes is a legitimate design.
+
+Whether the application is a web application is decided by matching service type *names*, never by
+touching an MVC type, so the check stays safe on a host with no ASP.NET Core shared framework.
+
+Both checks need an `IHost`; a bare `ServiceProvider` runs no hosted services and so runs no checks.
+Turn them off with `options.ValidateStartupWiring = false`.
 
 ---
 
@@ -362,6 +400,8 @@ services.AddDbContext<AppDbContext>((sp, options) =>
 | `StickToMasterAfterSaveChanges` | `true` | Read-after-write consistency within the scope. |
 | `AllowReplicaFallbackToMaster` | `true` | Use the master when no replica answers. |
 | `ReplicaFailureCooldown` | `30s` | How long a failed replica is stood down. |
+| `ValidateStartupWiring` | `true` | Fail fast on a context or a web app that was never wired up. |
+| `UnroutedDbContextTypes` | empty | Contexts deliberately left unrouted. |
 | `MvcActionFilterOrder` | `int.MinValue` | Filter position; lowest runs first. |
 
 Bind from configuration instead, if you prefer:
