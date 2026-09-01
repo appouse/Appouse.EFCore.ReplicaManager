@@ -386,6 +386,58 @@ Turn them off with `options.ValidateStartupWiring = false`.
 
 ---
 
+## Dapper and raw ADO.NET
+
+The interceptor fires on the paths **EF Core itself opens**. Reaching past EF Core to the connection
+object steps outside that, and the results are worth knowing before you rely on them:
+
+| What you write | Routed? |
+|---|---|
+| `db.Database.OpenConnectionAsync()`, then Dapper on `GetDbConnection()` | ✔ routed, with failover |
+| `db.Database.GetDbConnection()`, then `Open()` yourself | ✘ not routed |
+| `db.Database.GetDbConnection()`, then Dapper (which opens it for you) | ✘ not routed |
+
+`GetDbConnection()` hands you the raw `DbConnection`. Opening it yourself — or letting Dapper open it
+— is a plain ADO.NET call that EF Core never sees, so nothing rewrites the connection string.
+
+**The sharp edge.** An unrouted connection is not neutral: it carries whatever connection string was
+last written to it. After an EF query that went to a replica, EF closes the connection but leaves the
+replica's connection string on it, so raw access afterwards inherits that route — even under a
+`UseMasterDb()` scope. A Dapper `INSERT` issued that way reaches a read-only replica.
+
+```csharp
+using (dbTarget.UseReplicaDb())
+{
+    await db.Orders.CountAsync();          // routed to a replica
+}
+
+// Ambient target is the master again, but the connection still points at the replica:
+await db.Database.GetDbConnection().ExecuteAsync("INSERT INTO ...");   // goes to the replica
+```
+
+**Do this instead.** Let EF Core open it, then hand the connection to Dapper:
+
+```csharp
+await db.Database.OpenConnectionAsync();     // routed, and fails over between replicas
+try
+{
+    var orders = await db.Database.GetDbConnection().QueryAsync<Order>("SELECT ...");
+}
+finally
+{
+    await db.Database.CloseConnectionAsync();
+}
+```
+
+This goes through EF Core's connection pipeline, so it gets the ambient target, replica failover and
+health tracking exactly as an EF query would. Use `CloseConnectionAsync()` rather than closing the
+connection directly — EF Core reference-counts it.
+
+A connection you construct yourself, rather than taking from a `DbContext`, is outside this package
+entirely: resolve `IDbConnectionStringResolver` and choose the string explicitly.
+
+---
+
 ## Options
 
 | Option | Default | Meaning |
