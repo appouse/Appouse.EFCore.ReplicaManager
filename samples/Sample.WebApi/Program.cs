@@ -30,8 +30,12 @@ builder.Services.AddEfCoreMasterReplica(options =>
     // false when the master must not absorb replica traffic.
     options.AllowReplicaFallbackToMaster = true;
 
-    // Anything outside the HTTP pipeline - a health check, a migration - uses the master.
+    // Anything with no attribute and no UseTarget scope goes here, and nowhere else.
     options.DefaultTarget = DbTarget.Master;
+
+    // Off by default: adding this package changes no traffic until you ask it to. Turn it on once
+    // you are satisfied that every unattributed GET really is a lag-tolerant read.
+    options.RouteByHttpMethod = true;
 });
 
 // 2. Register the DbContext. The package stays provider-agnostic: you pick the provider, it hands
@@ -39,7 +43,8 @@ builder.Services.AddEfCoreMasterReplica(options =>
 builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, connectionString) =>
     options.UseSqlServer(connectionString));
 
-// 3. Route controllers and Razor Pages by attribute, then by HTTP verb.
+// 3. Route controllers and Razor Pages by attribute, and - because it was enabled above -
+//    by HTTP verb.
 builder.Services.AddControllers().AddDbTargetRouting();
 
 var app = builder.Build();

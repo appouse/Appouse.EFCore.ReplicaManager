@@ -1,16 +1,21 @@
 # Appouse.EFCore.ReplicaManager
 
+**English** · [Türkçe](https://github.com/appouse/Appouse.EFCore.ReplicaManager/blob/main/README.tr.md)
+
 Transparent **master/replica** database splitting for **EF Core 8+**.
 
-One master, as many replicas as you like. `GET` requests read from a replica, writes go to the
-master, and a replica that stops answering is skipped in favour of the next one. A `using` block
-gives you explicit control anywhere else — including background workers, where there is no
-`HttpContext` to hang routing off. Provider agnostic: SQL Server, PostgreSQL, MySQL, SQLite and
-anything else with an EF Core provider.
+One master, as many replicas as you like. You say which queries go where — with an attribute, a
+`using` block, or a default — and a replica that stops answering is skipped in favour of the next
+one. Provider agnostic: SQL Server, PostgreSQL, MySQL, Oracle, SQLite and anything else with an EF
+Core provider.
 
 ```bash
 dotnet add package Appouse.EFCore.ReplicaManager
 ```
+
+**Adding this package moves no traffic on its own.** Routing is explicit. A query with no attribute
+and no scope goes to `DefaultTarget` and nowhere else, so you can install it into a running
+application and turn routing on one endpoint at a time.
 
 ---
 
@@ -36,9 +41,6 @@ builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, connectionStr
 builder.Services.AddControllers().AddDbTargetRouting();
 
 var app = builder.Build();
-
-app.UseRouting();
-app.UseDbTargetRouting();   // optional: extends the same rules to Minimal APIs
 app.MapControllers();
 app.Run();
 ```
@@ -58,123 +60,112 @@ Resolved in this order — the first match wins:
 | 3 | `SaveChanges` is running | **always** `Master` |
 | 4 | A transaction is active | **always** `Master` |
 | 5 | An enclosing `UseTarget(...)` scope | that target |
-| 6 | HTTP verb — `GET`, `HEAD`, `OPTIONS`, `TRACE` | `Replica` |
-| 7 | HTTP verb — everything else | `Master` |
-| 8 | Nothing above applies | `options.DefaultTarget` |
+| 6 | HTTP verb — *only if you enable `RouteByHttpMethod`* | `GET`/`HEAD`/`OPTIONS`/`TRACE` → `Replica`, else `Master` |
+| 7 | Nothing above applies | `options.DefaultTarget` |
 
-Unknown verbs fall back to the master: guessing wrong towards a replica breaks writes, guessing
-wrong towards the master only costs a little capacity.
+Rule 6 is **off by default**. A `GET` is not reliably a read — plenty of them stamp a
+`LastSeenAt`, fill a cache or write an audit row — so moving every one of them onto a replica is a
+behaviour change you should opt into deliberately:
+
+```csharp
+options.RouteByHttpMethod = true;
+```
+
+Once enabled, unknown verbs fall back to the master: guessing wrong towards a replica breaks writes,
+guessing wrong towards the master only costs a little capacity.
+
+---
+
+## Saying where a query goes
+
+**By attribute**, per action or per controller — an attribute on the action always wins:
+
+```csharp
+[HttpGet("{id:int}")]
+[UseMasterDb]                   // a GET that must not read stale data
+public Task<Order?> Get(int id) => db.Orders.FindAsync(id).AsTask();
+
+[HttpPost("search")]
+[UseReplicaDb]                  // a POST that only reads
+public Task<List<Order>> Search(SearchRequest r) { /* ... */ }
+```
+
+**By scope**, anywhere — including where there is no `HttpContext` at all:
+
+```csharp
+using (dbTarget.UseReplicaDb())
+{
+    var ids = await db.Orders.Where(o => !o.Settled).Select(o => o.Id).ToListAsync();
+}
+```
+
+**By Minimal API helper**, per endpoint or per group:
+
+```csharp
+app.MapGet("/orders/{id:int}", handler).UseMasterDb();
+var reports = app.MapGroup("/reports").UseReplicaDb();
+```
+
+> A Minimal API endpoint is routed only if you use one of those helpers or add
+> `app.UseDbTargetRouting()` to the pipeline. Without either it falls back to `DefaultTarget`.
 
 ---
 
 ## Many replicas, and what happens when one dies
 
-The topology is **one master and any number of replicas**. Reads are spread across the replicas
-round-robin. When a replica refuses a connection, the package does not surface the error: it opens
-the connection against the next replica instead, and only gives up once every replica has been
-tried.
+The topology is **one master and any number of replicas**. Replica reads are spread round-robin.
+When a replica refuses a connection, the package does not surface the error: it opens the connection
+against the next replica instead, and only gives up once every replica has been tried.
 
 ```csharp
 options.MasterConnectionString  = "...";              // exactly one
-options.ReplicaConnectionString = "...replica-1...";  // first replica
+options.ReplicaConnectionString = "...replica-1...";
 options.ReplicaConnectionStrings.Add("...replica-2...");
 options.ReplicaConnectionStrings.Add("...replica-3...");
 ```
-
-What happens, in order:
 
 1. `IReplicaSelector` picks a starting replica — round-robin by default.
 2. Each replica is dialled in turn until one accepts the connection.
 3. A replica that refused is stood down for `ReplicaFailureCooldown` (30 seconds by default), so one
    dead node does not cost *every* request a connection timeout. It is moved to the back of the
    queue, never banned — if all the others fail too, it is still tried.
-4. If no replica answers, the read is served by the master, unless
-   `AllowReplicaFallbackToMaster` is `false` — then a `ReplicaUnavailableException` is thrown,
-   carrying every provider failure in an `AggregateException`.
+4. If no replica answers, the read is served by the master, unless `AllowReplicaFallbackToMaster` is
+   `false` — then a `ReplicaUnavailableException` is thrown, carrying every provider failure in an
+   `AggregateException`.
 
-Writes are never failed over, because there is only one master to write to. Retries there are left
-to EF Core's own execution strategy.
+Writes are never failed over, because there is only one master to write to.
 
 ### The one case failover cannot cover on its own
 
 Opening a connection is not the same as reaching a server. ADO.NET pools connections, so when a
 replica dies while the pool still holds warm handles to it, `OpenAsync` hands one back **without a
 network round trip and reports success**. The socket is dead, but nothing discovers that until the
-first command runs — long after the routing decision, and far too late to pick a different replica
-for that attempt.
-
-The package does two things about it, and asks one thing of you:
+first command runs — far too late to pick a different replica for that attempt.
 
 * A command failing on a connection routed to a replica marks that replica down immediately, so the
   *next* request avoids it instead of drawing another dead handle from the same pool.
-* It does not retry the failed command itself. That is EF Core's execution strategy's job.
-* **Enable that strategy.** It composes exactly as you would hope: the retry opens a fresh
-  connection, which routes to a replica already marked down.
+* The failed command is not retried here — that is EF Core's execution strategy's job.
+* **Enable that strategy.** The retry opens a fresh connection, which routes away from the node
+  already marked down.
 
 ```csharp
 builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
     options.UseNpgsql(cs, npgsql => npgsql.EnableRetryOnFailure(maxRetryCount: 5)));
 ```
 
-With retry enabled, a replica outage is invisible to application code. Without it, the first request
-after the outage surfaces one connection error before traffic settles on the survivor. Both
-behaviours are covered by the live tests.
+With retry enabled a replica outage is invisible to application code. Without it, the first request
+after the outage surfaces one connection error before traffic settles on the survivor. Both are
+covered by the live tests.
 
-`ReplicaUnavailableException` is deliberately not a transient error: it means every replica was
-dialled and refused, so retrying cannot help until one comes back.
-
-Swap the strategy for weighted, latency-aware or locality-aware selection:
-
-```csharp
-services.Replace(ServiceDescriptor.Singleton<IReplicaSelector, MyReplicaSelector>());
-services.Replace(ServiceDescriptor.Singleton<IReplicaHealthMonitor, MyHealthMonitor>());
-```
-
----
-
-## Attributes
-
-```csharp
-[ApiController]
-[Route("api/orders")]
-public sealed class OrdersController(AppDbContext db) : ControllerBase
-{
-    [HttpGet]                       // -> replica, by convention
-    public Task<List<Order>> List() => db.Orders.ToListAsync();
-
-    [HttpPost]                      // -> master, by convention
-    public async Task<Order> Create(Order order) { /* ... */ }
-
-    [HttpGet("{id:int}")]
-    [UseMasterDb]                   // a GET that must not read stale data
-    public Task<Order?> Get(int id) => db.Orders.FindAsync(id).AsTask();
-
-    [HttpPost("search")]
-    [UseReplicaDb]                  // a POST that only reads
-    public Task<List<Order>> Search(SearchRequest r) { /* ... */ }
-}
-```
-
-An attribute on the action always beats one on the controller.
-
-### Minimal APIs
-
-```csharp
-app.MapGet("/orders/{id:int}", handler).UseMasterDb();
-app.MapPost("/orders/report", handler).UseReplicaDb();
-
-var reports = app.MapGroup("/reports").UseReplicaDb();   // applies to the whole group
-```
-
-> A Minimal API endpoint is only routed if you either add `app.UseDbTargetRouting()` to the pipeline
-> or use one of the helpers above. Without either, it falls back to `DefaultTarget`.
+`ReplicaUnavailableException` is deliberately not transient: every replica was dialled and refused,
+so retrying cannot help until one comes back.
 
 ---
 
 ## Background workers, Hangfire, Quartz
 
-This is the part that `HttpContext`-based approaches cannot do. `IDbTargetContext` is a singleton
-whose state lives in an `AsyncLocal`, so it works identically outside the web stack:
+`IDbTargetContext` is a singleton whose state lives in an `AsyncLocal`, so it works identically
+outside the web stack:
 
 ```csharp
 public sealed class SettlementWorker(
@@ -186,15 +177,13 @@ public sealed class SettlementWorker(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
-        // The heavy scan is lag-tolerant: keep it off the master.
         List<int> candidates;
-        using (dbTarget.UseReplicaDb())
+        using (dbTarget.UseReplicaDb())          // heavy, lag-tolerant scan
         {
             candidates = await db.Orders.Where(o => !o.Settled).Select(o => o.Id).ToListAsync(stoppingToken);
         }
 
-        // Update where the rows are authoritative.
-        using (dbTarget.UseMasterDb())
+        using (dbTarget.UseMasterDb())           // authoritative update
         {
             /* ... */
             await db.SaveChangesAsync(stoppingToken);
@@ -209,42 +198,109 @@ and runs with no ASP.NET Core shared framework installed.
 
 ---
 
-## Replication lag: read your own writes
+## Dapper and raw ADO.NET
 
-The single most common way master/replica splitting breaks an application is a write followed
-immediately by a read that lands on a replica which has not caught up.
+The interceptor fires on the paths **EF Core itself opens**. Reaching past it to the connection
+object steps outside that:
 
-Two mechanisms handle this, both on by default:
+| What you write | Routed? |
+|---|---|
+| `db.Database.OpenRoutedConnectionAsync(...)` | ✔ routed, with failover |
+| `db.Database.OpenConnectionAsync()`, then Dapper on `GetDbConnection()` | ✔ routed, with failover |
+| `db.Database.GetDbConnection()`, then `Open()` yourself | ✘ not routed |
+| `db.Database.GetDbConnection()`, then Dapper (which opens it for you) | ✘ not routed |
 
-* **`ForceMasterOnSaveChanges`** — `SaveChanges` switches to the master *before* touching the
-  database. A `GET` action that stamps `LastSeenAt` or writes an audit row therefore works, instead
-  of failing against a read-only replica.
-* **`StickToMasterAfterSaveChanges`** — after a successful save, the rest of the scope stays on the
-  master. Within a request, everything read after a write is read back from the master.
+**The sharp edge.** An unrouted connection is not neutral: it carries whatever connection string was
+last written to it. After an EF query that went to a replica, EF closes the connection but leaves the
+replica's connection string on it, so raw access afterwards inherits that route — even under a
+`UseMasterDb()` scope. A Dapper `INSERT` issued that way reaches a read-only replica.
 
-Beyond the current scope the package **cannot** detect lag; nothing can, from inside the
-application. If a later request must observe an earlier write, pin it explicitly:
+**Do this instead.** Say which database you want, and let EF Core open it:
 
 ```csharp
-using (dbTarget.UseMasterDb())
-{
-    var order = await db.Orders.FindAsync(id);
-}
+// The master.
+await using var routed = await db.Database.OpenRoutedConnectionAsync(DbTarget.Master, cancellationToken);
+var order = await routed.Connection.QuerySingleAsync<Order>("SELECT * FROM Orders WHERE Id = @id", new { id });
+
+// A healthy replica, with failover between them.
+await using var routed = await db.Database.OpenRoutedConnectionAsync(DbTarget.Replica, cancellationToken);
+var rows = await routed.Connection.QueryAsync<Row>("SELECT ... /* heavy, lag-tolerant */");
+
+// Say nothing and you get the target already in effect - an enclosing UseTarget scope if there is
+// one, and your configured DefaultTarget otherwise.
+await using var routed = await db.Database.OpenRoutedConnectionAsync(cancellationToken);
 ```
+
+There is a synchronous `OpenRoutedConnection()` with the same two shapes. Disposing the handle
+returns the connection to the context rather than closing it directly, because EF Core
+reference-counts it; disposing twice is a no-op.
+
+The target binds while the connection is being opened. If the context is already holding an open
+connection, EF Core hands back the existing one and its route stands — a connection string cannot be
+changed while the connection is open.
+
+A connection you construct yourself, rather than taking from a `DbContext`, is outside this package
+entirely: resolve `IDbConnectionStringResolver` and choose the string explicitly.
 
 ---
 
-## Migrations
+## Read your own writes
 
-`MasterConnectionString` is the canonical connection string: it is what the provider gets for model
-building, what `dotnet ef` uses, and what `Database.Migrate()` connects to. Keep `DefaultTarget` at
-`Master`, or wrap migration explicitly:
+Two mechanisms, both on by default:
+
+* **`ForceMasterOnSaveChanges`** — `SaveChanges` switches to the master *before* touching the
+  database, so a `GET` action that stamps `LastSeenAt` or writes an audit row works instead of
+  failing against a read-only replica.
+* **`StickToMasterAfterSaveChanges`** — after a successful save, the rest of the scope stays on the
+  master, so everything read after a write is read back from the master.
+
+Beyond the current scope the package cannot detect replication lag; nothing can, from inside the
+application. If a later request must observe an earlier write, pin it explicitly with
+`UseMasterDb()`.
+
+---
+
+## Start-up checks
+
+Two ways of wiring this package up wrongly used to produce no error at all. Both are now caught
+before the first request.
+
+**A `DbContext` registered without the interceptors throws.** The message names the context and both
+ways to fix it. It is an error rather than a warning because the package is doing literally nothing
+for that context. A second context that deliberately lives elsewhere is declared rather than
+silenced:
 
 ```csharp
-using (dbTarget.UseMasterDb())
+options.UnroutedDbContextTypes.Add(typeof(AuditDbContext));
+```
+
+**Controllers registered with no routing mechanism warn.** If the application called
+`AddControllers()` but neither `services.AddDbTargetMvcFilter()` nor `app.UseDbTargetRouting()`, a
+warning is logged naming both. A warning rather than an error, because routing purely through
+`UseTarget` scopes is a legitimate design.
+
+Whether the application is a web application is decided by matching service type *names*, never by
+touching an MVC type, so the check stays safe on a host with no ASP.NET Core shared framework. Both
+checks need an `IHost`. Turn them off with `options.ValidateStartupWiring = false`.
+
+---
+
+## Registering the DbContext
+
+| Registration | Result |
+|---|---|
+| `AddMasterReplicaDbContext<T>` | Routed |
+| `AddMasterReplicaDbContextPool<T>` | Routed; no routing state sticks to a pooled instance |
+| `AddMasterReplicaDbContextFactory<T>` | Routed; a produced context follows the flow that *uses* it |
+| `AddDbContext<T>` + `UseMasterReplicaSplitting(sp)` | Routed, identically |
+| `AddDbContext<T>` alone | Not routed — the host refuses to start |
+
+```csharp
+services.AddDbContext<AppDbContext>((sp, options) =>
 {
-    await db.Database.MigrateAsync();
-}
+    options.UseNpgsql(masterConnectionString);
+    options.UseMasterReplicaSplitting(sp);
+});
 ```
 
 ---
@@ -265,9 +321,9 @@ and `Close` — so any EF Core relational provider works.
 
 Every one of these runs against three real database servers — one master and two replicas, each
 holding a different marker row so a test can tell which one answered. The integration suite starts
-them in containers, proves that reads land on a replica and writes on the master, then **stops a
-replica's container mid-test** and proves reads keep being served by the survivor, that a total
-outage falls back to the master, and that a recovered node is used again once its cooldown expires.
+them in containers, then **stops a replica's container mid-test** and proves reads keep being served
+by the survivor, that a total outage falls back to the master, and that a recovered node is used
+again once its cooldown expires.
 
 ```bash
 dotnet test tests/Appouse.EFCore.ReplicaManager.IntegrationTests   # needs Docker
@@ -275,173 +331,46 @@ dotnet test tests/Appouse.EFCore.ReplicaManager.IntegrationTests   # needs Docke
 
 Without Docker those tests skip themselves rather than fail.
 
-```csharp
-builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseSqlServer(cs));
-builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseNpgsql(cs));
-builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseOracle(cs));
-builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) => options.UseSqlite(cs));
-builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
-    options.UseMySql(cs, new MySqlServerVersion(new Version(8, 0, 34))));
-```
-
 ### Provider notes
 
 **MySQL — do not use `ServerVersion.AutoDetect`.** It opens a connection while the service provider
-is being built, so application start-up would depend on the master being reachable, before any
-routing exists. Pass an explicit `MySqlServerVersion` as above.
+is being built, so start-up would depend on the master being reachable before any routing exists.
+Pass an explicit `MySqlServerVersion`.
 
 **SQL Server — mark the replica connection strings read-only.** When the replicas are Always On
-secondaries, add `ApplicationIntent=ReadOnly` to each replica connection string so the listener
-routes to a readable secondary. The master connection string must not carry it.
+secondaries, add `ApplicationIntent=ReadOnly` to each replica connection string. The master
+connection string must not carry it.
 
-**PostgreSQL — Npgsql's multi-host support is complementary, not redundant.** Npgsql can take
-`Host=h1,h2,h3` with `Target Session Attributes=prefer-standby` and `Load Balance Hosts=true` and do
-its own connection-level balancing. That still cannot know a `GET` from a `POST`, which is what this
-package decides. Use either style: several `ReplicaConnectionStrings` entries, or one multi-host
-replica string — or both.
+**PostgreSQL — Npgsql's multi-host support is complementary.** It can balance connections itself with
+`Host=h1,h2,h3` and `Target Session Attributes`, but it cannot tell a read from a write the way an
+attribute or a scope does. Use either style, or both.
 
-**Oracle — an Active Data Guard standby is read-only.** It works as a replica; writes must reach the
-primary, which the routing rules already guarantee. Note that Oracle's EF Core provider ships **no
-`EnableRetryOnFailure`**, unlike the other three, so transparent recovery from a warm-pool outage
-needs an execution strategy of your own:
-
-```csharp
-options.UseOracle(cs, oracle => oracle.ExecutionStrategy(d => new MyRetryingExecutionStrategy(d)));
-```
-
+**Oracle — an Active Data Guard standby is read-only** and works as a replica. Note that Oracle's EF
+Core provider ships **no `EnableRetryOnFailure`**, unlike the other three, so transparent recovery
+from a warm-pool outage needs an execution strategy of your own;
 `tests/Appouse.EFCore.ReplicaManager.IntegrationTests/OracleCluster.cs` has a working one to copy.
 
-**SQLite has no replication.** It is genuinely useful for tests — the suite in this repository routes
-between two real SQLite files to prove which database served a query — but it is not a production
-topology.
+**SQLite has no replication.** Useful for tests — this repository's own suite routes between two real
+SQLite files — but not a production topology.
 
-**All providers: each connection string gets its own ADO.NET connection pool.** A master plus three
-replicas is four pools, each with its own `Max Pool Size`. Size them for the traffic each node
-actually takes rather than copying one number across all four.
-
-**All providers: the model is built from the master connection string.** Replicas must expose the
-same schema. EF Core builds one model, and migrations run against the master.
+**Every connection string gets its own ADO.NET pool.** A master plus three replicas is four pools,
+each with its own `Max Pool Size`. And the model is built from the master connection string, so
+replicas must expose the same schema.
 
 ---
 
-## Registering the DbContext
+## Migrations
 
-| Registration | Result |
-|---|---|
-| `AddMasterReplicaDbContext<T>` | Routed |
-| `AddMasterReplicaDbContextPool<T>` | Routed; no routing state sticks to a pooled instance |
-| `AddMasterReplicaDbContextFactory<T>` | Routed; a produced context follows the flow that *uses* it |
-| `AddDbContext<T>` + `UseMasterReplicaSplitting(sp)` | Routed, identically |
-| `AddDbContext<T>` alone | **Not routed — the host refuses to start** |
-
-`AddEfCoreMasterReplica` registers services but never touches a `DbContext` on its own, so a plain
-`AddDbContext` used to produce no error and no warning — just a context that quietly ignored the
-ambient target. That now fails at start-up instead. If you register the context yourself, wire the
-interceptors in:
+`MasterConnectionString` is the canonical connection string: it is what the provider gets for model
+building, what `dotnet ef` uses, and what `Database.Migrate()` connects to. Keep `DefaultTarget` at
+`Master`, or wrap migration explicitly:
 
 ```csharp
-services.AddDbContext<AppDbContext>((sp, options) =>
+using (dbTarget.UseMasterDb())
 {
-    options.UseNpgsql(masterConnectionString);
-    options.UseMasterReplicaSplitting(sp);
-});
-```
-
----
-
-## Start-up checks
-
-Two ways of wiring this package up wrongly used to produce no error at all, just an application that
-looked configured and sent every query to `DefaultTarget`. Both are now caught before the first
-request.
-
-**A `DbContext` registered without the interceptors throws.** The message names the context and both
-ways to fix it. It is an error rather than a warning because the package is doing literally nothing
-for that context.
-
-```
-Master/replica splitting is registered, but AppDbContext was registered without it, so every query
-from that context ignores the ambient target ... Register the context with
-services.AddMasterReplicaDbContext<TContext>(...), or, if you call AddDbContext yourself, add
-options.UseMasterReplicaSplitting(serviceProvider) inside it.
-```
-
-A second context that deliberately lives elsewhere — an outbox, an audit log, a job store — is
-declared rather than silenced:
-
-```csharp
-options.UnroutedDbContextTypes.Add(typeof(AuditDbContext));
-```
-
-**Controllers registered with no routing mechanism warn.** If the application called
-`AddControllers()` but neither `services.AddDbTargetMvcFilter()` nor `app.UseDbTargetRouting()`, a
-warning is logged naming both. This one is a warning rather than an error because routing purely
-through `UseTarget` scopes is a legitimate design.
-
-Whether the application is a web application is decided by matching service type *names*, never by
-touching an MVC type, so the check stays safe on a host with no ASP.NET Core shared framework.
-
-Both checks need an `IHost`; a bare `ServiceProvider` runs no hosted services and so runs no checks.
-Turn them off with `options.ValidateStartupWiring = false`.
-
----
-
-## Dapper and raw ADO.NET
-
-The interceptor fires on the paths **EF Core itself opens**. Reaching past EF Core to the connection
-object steps outside that, and the results are worth knowing before you rely on them:
-
-| What you write | Routed? |
-|---|---|
-| `db.Database.OpenRoutedConnectionAsync()` | ✔ routed, with failover |
-| `db.Database.OpenConnectionAsync()`, then Dapper on `GetDbConnection()` | ✔ routed, with failover |
-| `db.Database.GetDbConnection()`, then `Open()` yourself | ✘ not routed |
-| `db.Database.GetDbConnection()`, then Dapper (which opens it for you) | ✘ not routed |
-
-`GetDbConnection()` hands you the raw `DbConnection`. Opening it yourself — or letting Dapper open it
-— is a plain ADO.NET call that EF Core never sees, so nothing rewrites the connection string.
-
-**The sharp edge.** An unrouted connection is not neutral: it carries whatever connection string was
-last written to it. After an EF query that went to a replica, EF closes the connection but leaves the
-replica's connection string on it, so raw access afterwards inherits that route — even under a
-`UseMasterDb()` scope. A Dapper `INSERT` issued that way reaches a read-only replica.
-
-```csharp
-using (dbTarget.UseReplicaDb())
-{
-    await db.Orders.CountAsync();          // routed to a replica
+    await db.Database.MigrateAsync();
 }
-
-// Ambient target is the master again, but the connection still points at the replica:
-await db.Database.GetDbConnection().ExecuteAsync("INSERT INTO ...");   // goes to the replica
 ```
-
-**Do this instead.** `OpenRoutedConnectionAsync()` lets EF Core open the connection — which routes
-it — and lends it to you until the `using` ends:
-
-```csharp
-await using var routed = await db.Database.OpenRoutedConnectionAsync(cancellationToken);
-
-var orders = await routed.Connection.QueryAsync<Order>("SELECT * FROM Orders WHERE ...");
-```
-
-There is a synchronous `OpenRoutedConnection()` too. Both go through EF Core's connection pipeline,
-so they get the ambient target, replica failover and replica health tracking exactly as an EF query
-would — including re-routing away from whatever the previous query left on the connection.
-
-Disposing the handle returns the connection to the context rather than closing it directly, because
-EF Core reference-counts it. Disposing twice is a no-op.
-
-The long form is equivalent, if you would rather not take the handle:
-
-```csharp
-await db.Database.OpenConnectionAsync();
-try   { /* Dapper on db.Database.GetDbConnection() */ }
-finally { await db.Database.CloseConnectionAsync(); }
-```
-
-A connection you construct yourself, rather than taking from a `DbContext`, is outside this package
-entirely: resolve `IDbConnectionStringResolver` and choose the string explicitly.
 
 ---
 
@@ -453,7 +382,7 @@ entirely: resolve `IDbConnectionStringResolver` and choose the string explicitly
 | `ReplicaConnectionString` | *(required)* | First replica. Set it equal to the master to disable splitting. |
 | `ReplicaConnectionStrings` | empty | Additional replicas, load-balanced and failed over. |
 | `DefaultTarget` | `Master` | Used when no rule applies. |
-| `RouteByHttpMethod` | `true` | Apply the verb convention. |
+| `RouteByHttpMethod` | **`false`** | Apply the HTTP verb convention. Off, so adding the package moves no traffic. |
 | `ForceMasterInsideTransaction` | `true` | Transactions always use the master. |
 | `ForceMasterOnSaveChanges` | `true` | `SaveChanges` always uses the master. |
 | `StickToMasterAfterSaveChanges` | `true` | Read-after-write consistency within the scope. |
@@ -472,6 +401,21 @@ builder.Services.AddEfCoreMasterReplica(
 
 Configuration is validated at host start-up, so a missing connection string stops the application
 instead of surfacing as a failure on the first query.
+
+---
+
+## Extension points
+
+```csharp
+// Pick replicas by latency, health or locality instead of round-robin.
+services.Replace(ServiceDescriptor.Singleton<IReplicaSelector, MyReplicaSelector>());
+
+// Track replica availability your own way.
+services.Replace(ServiceDescriptor.Singleton<IReplicaHealthMonitor, MyHealthMonitor>());
+
+// Source connection strings from a tenant catalogue or a secret store.
+services.Replace(ServiceDescriptor.Singleton<IDbConnectionStringResolver, MyResolver>());
+```
 
 ---
 
@@ -508,8 +452,6 @@ Three design decisions are load-bearing:
   transaction is open, or after `Database.OpenConnection()`. Start that work inside a
   `UseTarget(...)` scope; the route is fixed when the connection opens.
 * Deferred execution follows the target in effect when the query *runs*, not when it is composed.
-  An `IQueryable` built inside a scope and enumerated outside it uses the outer target.
-* Each connection string gets its own ADO.NET connection pool. Size `Max Pool Size` accordingly.
 * Connection strings are never written to the log, at any level.
 
 ---

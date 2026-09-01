@@ -82,17 +82,41 @@ public sealed class MasterReplicaOptions
     public DbTarget DefaultTarget { get; set; } = DbTarget.Master;
 
     /// <summary>
-    /// When <see langword="true"/> (the default), HTTP <c>GET</c>, <c>HEAD</c>, <c>OPTIONS</c> and
-    /// <c>TRACE</c> requests are routed to <see cref="DbTarget.Replica"/> and every other verb to
-    /// <see cref="DbTarget.Master"/>. Explicit attributes always win over this convention.
+    /// When <see langword="true"/>, HTTP <c>GET</c>, <c>HEAD</c>, <c>OPTIONS</c> and <c>TRACE</c>
+    /// requests are routed to <see cref="DbTarget.Replica"/> and every other verb to
+    /// <see cref="DbTarget.Master"/>. <strong>Off by default.</strong>
     /// <para>
-    /// TR: <see langword="true"/> ise (varsayılan), HTTP <c>GET</c>, <c>HEAD</c>, <c>OPTIONS</c> ve
-    /// <c>TRACE</c> istekleri <see cref="DbTarget.Replica"/>, diğer tüm metotlar
-    /// <see cref="DbTarget.Master"/> hedefine yönlendirilir. Açık attribute'lar bu konvansiyonu her
-    /// zaman geçersiz kılar.
+    /// TR: <see langword="true"/> ise HTTP <c>GET</c>, <c>HEAD</c>, <c>OPTIONS</c> ve <c>TRACE</c>
+    /// istekleri <see cref="DbTarget.Replica"/>, diğer tüm metotlar <see cref="DbTarget.Master"/>
+    /// hedefine yönlendirilir. <strong>Varsayılan olarak kapalıdır.</strong>
     /// </para>
     /// </summary>
-    public bool RouteByHttpMethod { get; set; } = true;
+    /// <remarks>
+    /// Routing is explicit by default: a request with no <c>[UseMasterDb]</c>/<c>[UseReplicaDb]</c>
+    /// attribute and no <see cref="IDbTargetContext.UseTarget"/> scope goes to
+    /// <see cref="DefaultTarget"/> and nowhere else. Adding this package to an existing application
+    /// therefore changes nothing until you ask it to, which is the point: a <c>GET</c> is not
+    /// reliably a read, and silently moving every one of them onto a replica is a behaviour change
+    /// no one asked for.
+    /// <para>
+    /// TR: Yönlendirme varsayılan olarak açıktır ve yalnızca söylediğinizi yapar:
+    /// <c>[UseMasterDb]</c>/<c>[UseReplicaDb]</c> attribute'u ve
+    /// <see cref="IDbTargetContext.UseTarget"/> scope'u olmayan bir istek
+    /// <see cref="DefaultTarget"/> hedefine gider, başka hiçbir yere değil. Bu yüzden paketi mevcut
+    /// bir uygulamaya eklemek, siz istemedikçe hiçbir şeyi değiştirmez. Amaç da budur: bir
+    /// <c>GET</c> her zaman okuma anlamına gelmez ve hepsini sessizce replica'ya taşımak, kimsenin
+    /// istemediği bir davranış değişikliğidir.
+    /// </para>
+    /// <para>
+    /// Turn it on once you have satisfied yourself that every unattributed <c>GET</c> really is a
+    /// lag-tolerant read.
+    /// </para>
+    /// <para>
+    /// TR: İşaretlenmemiş her <c>GET</c>'in gerçekten gecikmeye dayanıklı bir okuma olduğuna ikna
+    /// olduktan sonra açın.
+    /// </para>
+    /// </remarks>
+    public bool RouteByHttpMethod { get; set; }
 
     /// <summary>
     /// When <see langword="true"/> (the default), a connection opened while a transaction is active

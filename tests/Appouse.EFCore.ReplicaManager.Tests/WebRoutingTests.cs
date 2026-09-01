@@ -64,6 +64,10 @@ public sealed class WebRoutingTests : IClassFixture<TwoDatabaseFixture>, IAsyncL
         {
             options.MasterConnectionString = _fx.MasterConnectionString;
             options.ReplicaConnectionString = _fx.ReplicaConnectionString;
+
+            // The HTTP verb convention is off by default; these tests are about the convention, so
+            // they ask for it.
+            options.RouteByHttpMethod = true;
         });
         builder.Services.AddMasterReplicaDbContext<MarkerContext>((options, cs) => options.UseSqlite(cs));
 

@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Appouse.EFCore.ReplicaManager;
@@ -24,9 +25,9 @@ namespace Microsoft.EntityFrameworkCore;
 /// <c>Database.GetDbConnection()</c> size ham bağlantıyı verir; onu kendiniz açmanız - ya da
 /// Dapper'ın açması - EF Core'un hiç görmediği düz bir ADO.NET çağrısıdır ve bağlantı dizesini
 /// kimse yeniden yazmaz. Dahası, yönlendirilmemiş bir bağlantı nötr değildir: kendisine en son
-/// yazılan dizeyi taşır. Bu yüzden bir EF sorgusundan sonra yapılan ham erişim, farklı bir scope
-/// içinde bile o sorgunun rotasını devralır ve bu yolla yapılan bir yazma salt okunur bir
-/// replica'ya ulaşabilir.
+/// yazılan dizeyi taşır. Bu yüzden bir EF sorgusundan sonraki ham erişim, farklı bir scope içinde
+/// bile o sorgunun rotasını devralır ve bu yolla yapılan bir yazma salt okunur bir replica'ya
+/// ulaşabilir.
 /// </para>
 /// <para>
 /// These helpers close that gap by letting EF Core open the connection, which routes it, applies
@@ -41,11 +42,11 @@ namespace Microsoft.EntityFrameworkCore;
 public static class ReplicaManagerDatabaseFacadeExtensions
 {
     /// <summary>
-    /// Opens the context's connection through EF Core - so it is routed - and lends it to you until
-    /// the returned handle is disposed.
+    /// Opens the context's connection through EF Core against the target already in effect, and
+    /// lends it to you until the returned handle is disposed.
     /// <para>
-    /// TR: Context'in bağlantısını EF Core üzerinden açar - böylece yönlendirilir - ve döndürülen
-    /// tutamaç dispose edilene kadar size ödünç verir.
+    /// TR: Context'in bağlantısını, halihazırda geçerli olan hedefe karşı EF Core üzerinden açar ve
+    /// döndürülen tutamaç dispose edilene kadar size ödünç verir.
     /// </para>
     /// </summary>
     /// <param name="database">
@@ -57,24 +58,26 @@ public static class ReplicaManagerDatabaseFacadeExtensions
     /// <para>TR: Açma işlemini iptal eder.</para>
     /// </param>
     /// <returns>
-    /// A handle whose <see cref="RoutedDbConnection.Connection"/> is open and routed, and which
-    /// returns the connection to the context when disposed.
+    /// A handle whose <see cref="RoutedDbConnection.Connection"/> is open and routed.
     /// <para>
-    /// TR: <see cref="RoutedDbConnection.Connection"/> özelliği açık ve yönlendirilmiş olan, dispose
-    /// edildiğinde bağlantıyı context'e geri veren bir tutamaç.
+    /// TR: <see cref="RoutedDbConnection.Connection"/> özelliği açık ve yönlendirilmiş olan tutamaç.
     /// </para>
     /// </returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="database"/> is <see langword="null"/>.
     /// <para>TR: <paramref name="database"/> <see langword="null"/>.</para>
     /// </exception>
-    /// <exception cref="ReplicaUnavailableException">
-    /// A replica was requested, none accepted the connection, and falling back to the master is
-    /// disabled.
+    /// <remarks>
+    /// "The target already in effect" means an enclosing <see cref="IDbTargetContext.UseTarget"/>
+    /// scope if there is one, and <see cref="MasterReplicaOptions.DefaultTarget"/> otherwise. Say
+    /// nothing and you get your configured default.
     /// <para>
-    /// TR: Replica istendi, hiçbiri bağlantıyı kabul etmedi ve master'a düşme kapalı.
+    /// TR: "Halihazırda geçerli olan hedef", varsa çevreleyen bir
+    /// <see cref="IDbTargetContext.UseTarget"/> scope'u, yoksa
+    /// <see cref="MasterReplicaOptions.DefaultTarget"/> demektir. Hiçbir şey söylemezseniz
+    /// yapılandırdığınız varsayılanı alırsınız.
     /// </para>
-    /// </exception>
+    /// </remarks>
     /// <example>
     /// <code>
     /// await using var routed = await db.Database.OpenRoutedConnectionAsync(cancellationToken);
@@ -88,6 +91,95 @@ public static class ReplicaManagerDatabaseFacadeExtensions
         ArgumentNullException.ThrowIfNull(database);
 
         await database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        return new RoutedDbConnection(database);
+    }
+
+    /// <summary>
+    /// Opens the context's connection through EF Core against <paramref name="target"/> - the master,
+    /// or whichever replica is currently healthy - and lends it to you until the returned handle is
+    /// disposed.
+    /// <para>
+    /// TR: Context'in bağlantısını <paramref name="target"/> hedefine - master'a veya o an sağlıklı
+    /// olan replica'ya - karşı EF Core üzerinden açar ve döndürülen tutamaç dispose edilene kadar
+    /// size ödünç verir.
+    /// </para>
+    /// </summary>
+    /// <param name="database">
+    /// The context's database facade.
+    /// <para>TR: Context'in veritabanı arayüzü.</para>
+    /// </param>
+    /// <param name="target">
+    /// Which database to open against. <see cref="DbTarget.Replica"/> picks a healthy replica and
+    /// fails over between them; <see cref="DbTarget.Master"/> opens the single master.
+    /// <para>
+    /// TR: Hangi veritabanına açılacağı. <see cref="DbTarget.Replica"/> sağlıklı bir replica seçer ve
+    /// aralarında failover yapar; <see cref="DbTarget.Master"/> tek master'a açar.
+    /// </para>
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels the open.
+    /// <para>TR: Açma işlemini iptal eder.</para>
+    /// </param>
+    /// <returns>
+    /// A handle whose <see cref="RoutedDbConnection.Connection"/> is open against
+    /// <paramref name="target"/>.
+    /// <para>
+    /// TR: <see cref="RoutedDbConnection.Connection"/> özelliği <paramref name="target"/> hedefine
+    /// açılmış olan tutamaç.
+    /// </para>
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="database"/> is <see langword="null"/>.
+    /// <para>TR: <paramref name="database"/> <see langword="null"/>.</para>
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="target"/> is not a defined <see cref="DbTarget"/> value.
+    /// <para>TR: <paramref name="target"/> tanımlı bir <see cref="DbTarget"/> değeri değil.</para>
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// This <c>DbContext</c> was registered without master/replica splitting, so there is no routing
+    /// to apply.
+    /// <para>
+    /// TR: Bu <c>DbContext</c> master/replica ayrımı olmadan kaydedilmiş; uygulanacak bir yönlendirme
+    /// yok.
+    /// </para>
+    /// </exception>
+    /// <exception cref="ReplicaUnavailableException">
+    /// <see cref="DbTarget.Replica"/> was requested, none accepted the connection, and falling back
+    /// to the master is disabled.
+    /// <para>
+    /// TR: <see cref="DbTarget.Replica"/> istendi, hiçbiri bağlantıyı kabul etmedi ve master'a düşme
+    /// kapalı.
+    /// </para>
+    /// </exception>
+    /// <remarks>
+    /// The request only binds while the connection is being opened. If the context is already
+    /// holding an open connection, EF Core hands back the existing one and its route stands, because
+    /// a connection string cannot be changed while the connection is open.
+    /// <para>
+    /// TR: İstek yalnızca bağlantı açılırken bağlayıcıdır. Context zaten açık bir bağlantı tutuyorsa
+    /// EF Core mevcut olanı verir ve onun rotası geçerli kalır; çünkü bağlantı açıkken bağlantı
+    /// dizesi değiştirilemez.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// await using var routed = await db.Database.OpenRoutedConnectionAsync(DbTarget.Replica, cancellationToken);
+    /// var report = await routed.Connection.QueryAsync&lt;Row&gt;("SELECT ... /* heavy, lag-tolerant */");
+    /// </code>
+    /// </example>
+    public static async Task<RoutedDbConnection> OpenRoutedConnectionAsync(
+        this DatabaseFacade database,
+        DbTarget target,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+
+        using (RequireTargetContext(database).UseTarget(target))
+        {
+            await database.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         return new RoutedDbConnection(database);
     }
 
@@ -113,24 +205,88 @@ public static class ReplicaManagerDatabaseFacadeExtensions
     /// <paramref name="database"/> is <see langword="null"/>.
     /// <para>TR: <paramref name="database"/> <see langword="null"/>.</para>
     /// </exception>
-    /// <exception cref="ReplicaUnavailableException">
-    /// A replica was requested, none accepted the connection, and falling back to the master is
-    /// disabled.
-    /// <para>
-    /// TR: Replica istendi, hiçbiri bağlantıyı kabul etmedi ve master'a düşme kapalı.
-    /// </para>
-    /// </exception>
-    /// <example>
-    /// <code>
-    /// using var routed = db.Database.OpenRoutedConnection();
-    /// var orders = routed.Connection.Query&lt;Order&gt;("SELECT * FROM Orders");
-    /// </code>
-    /// </example>
     public static RoutedDbConnection OpenRoutedConnection(this DatabaseFacade database)
     {
         ArgumentNullException.ThrowIfNull(database);
 
         database.OpenConnection();
         return new RoutedDbConnection(database);
+    }
+
+    /// <summary>
+    /// Synchronous counterpart of
+    /// <see cref="OpenRoutedConnectionAsync(DatabaseFacade,DbTarget,CancellationToken)"/>.
+    /// <para>
+    /// TR: <see cref="OpenRoutedConnectionAsync(DatabaseFacade,DbTarget,CancellationToken)"/>
+    /// metodunun senkron karşılığı.
+    /// </para>
+    /// </summary>
+    /// <param name="database">
+    /// The context's database facade.
+    /// <para>TR: Context'in veritabanı arayüzü.</para>
+    /// </param>
+    /// <param name="target">
+    /// Which database to open against.
+    /// <para>TR: Hangi veritabanına açılacağı.</para>
+    /// </param>
+    /// <returns>
+    /// A handle whose <see cref="RoutedDbConnection.Connection"/> is open against
+    /// <paramref name="target"/>.
+    /// <para>
+    /// TR: <see cref="RoutedDbConnection.Connection"/> özelliği <paramref name="target"/> hedefine
+    /// açılmış olan tutamaç.
+    /// </para>
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="database"/> is <see langword="null"/>.
+    /// <para>TR: <paramref name="database"/> <see langword="null"/>.</para>
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// This <c>DbContext</c> was registered without master/replica splitting.
+    /// <para>TR: Bu <c>DbContext</c> master/replica ayrımı olmadan kaydedilmiş.</para>
+    /// </exception>
+    public static RoutedDbConnection OpenRoutedConnection(this DatabaseFacade database, DbTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+
+        using (RequireTargetContext(database).UseTarget(target))
+        {
+            database.OpenConnection();
+        }
+
+        return new RoutedDbConnection(database);
+    }
+
+    /// <summary>
+    /// Finds the ambient target store by locating this context's own routing interceptor, which also
+    /// proves the context is actually wired for master/replica splitting.
+    /// <para>
+    /// TR: Ortam hedef deposunu, bu context'in kendi yönlendirme interceptor'ını bularak elde eder;
+    /// bu aynı zamanda context'in gerçekten master/replica ayrımına bağlı olduğunu da kanıtlar.
+    /// </para>
+    /// </summary>
+    /// <param name="database">
+    /// The context's database facade.
+    /// <para>TR: Context'in veritabanı arayüzü.</para>
+    /// </param>
+    /// <returns>
+    /// The ambient target store.
+    /// <para>TR: Ortam hedef deposu.</para>
+    /// </returns>
+    private static IDbTargetContext RequireTargetContext(DatabaseFacade database)
+    {
+        var interceptor = database
+            .GetService<IDbContextOptions>()
+            .FindExtension<CoreOptionsExtension>()?
+            .Interceptors?
+            .OfType<MasterReplicaDbInterceptor>()
+            .FirstOrDefault();
+
+        return interceptor?.TargetContext
+               ?? throw new InvalidOperationException(
+                   "This DbContext was registered without master/replica splitting, so a target cannot be " +
+                   "applied to it. Register it with services.AddMasterReplicaDbContext<TContext>(...), or, if " +
+                   "you call AddDbContext yourself, add options.UseMasterReplicaSplitting(serviceProvider) " +
+                   "inside it.");
     }
 }

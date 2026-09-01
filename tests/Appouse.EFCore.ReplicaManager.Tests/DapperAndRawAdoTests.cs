@@ -237,4 +237,73 @@ public sealed class DapperAndRawAdoTests : IClassFixture<TwoDatabaseFixture>
             Assert.Equal("replica", routed.Connection.QuerySingle<string>(Sql));
         }
     }
+
+    [Fact]
+    public async Task An_explicit_target_beats_the_ambient_one()
+    {
+        await using var provider = Build();
+        var target = provider.GetRequiredService<IDbTargetContext>();
+
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        // Ambient says master; the caller asks for a replica and gets one.
+        await using (var routed = await db.Database.OpenRoutedConnectionAsync(DbTarget.Replica))
+        {
+            Assert.Equal("replica", await routed.Connection.QuerySingleAsync<string>(Sql));
+        }
+
+        // Ambient says replica; the caller asks for the master and gets it.
+        using (target.UseReplicaDb())
+        {
+            await using var routed = await db.Database.OpenRoutedConnectionAsync(DbTarget.Master);
+            Assert.Equal("master", await routed.Connection.QuerySingleAsync<string>(Sql));
+        }
+    }
+
+    [Fact]
+    public async Task Asking_for_nothing_gives_the_configured_default()
+    {
+        await using var provider = Build();
+
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        await using var routed = await db.Database.OpenRoutedConnectionAsync();
+        Assert.Equal("master", await routed.Connection.QuerySingleAsync<string>(Sql));
+    }
+
+    [Fact]
+    public void The_synchronous_helper_takes_a_target_too()
+    {
+        using var provider = Build();
+        using var scope = provider.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        using var routed = db.Database.OpenRoutedConnection(DbTarget.Replica);
+        Assert.Equal("replica", routed.Connection.QuerySingle<string>(Sql));
+    }
+
+    [Fact]
+    public async Task Asking_for_a_target_on_an_unrouted_context_explains_why_it_cannot()
+    {
+        var services = new ServiceCollection();
+        services.AddEfCoreMasterReplica(options =>
+        {
+            options.MasterConnectionString = _fx.MasterConnectionString;
+            options.ReplicaConnectionString = _fx.ReplicaConnectionString;
+            options.ValidateStartupWiring = false;
+        });
+        services.AddDbContext<MarkerContext>(o => o.UseSqlite(_fx.MasterConnectionString));
+
+        await using var provider = services.BuildServiceProvider();
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => db.Database.OpenRoutedConnectionAsync(DbTarget.Replica));
+
+        Assert.Contains("AddMasterReplicaDbContext", error.Message, StringComparison.Ordinal);
+        Assert.Contains("UseMasterReplicaSplitting", error.Message, StringComparison.Ordinal);
+    }
 }

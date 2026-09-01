@@ -167,6 +167,18 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
         _logger = logger;
     }
 
+    /// <summary>
+    /// The ambient store this interceptor routes by. Reached by
+    /// <c>Database.OpenRoutedConnectionAsync</c>, which needs it to honour an explicitly requested
+    /// target, and which finds this interceptor by looking through the context's own options.
+    /// <para>
+    /// TR: Bu interceptor'ın yönlendirme için kullandığı ortam deposu.
+    /// <c>Database.OpenRoutedConnectionAsync</c>, açıkça istenen bir hedefi uygulayabilmek için buna
+    /// erişir ve bu interceptor'ı context'in kendi ayarlarına bakarak bulur.
+    /// </para>
+    /// </summary>
+    internal IDbTargetContext TargetContext => _targetContext;
+
     /// <inheritdoc />
     public override InterceptionResult ConnectionOpening(
         DbConnection connection,

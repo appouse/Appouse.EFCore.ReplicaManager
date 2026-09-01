@@ -8,12 +8,12 @@ namespace Sample.WebApi;
 [Route("api/orders")]
 public sealed class OrdersController(AppDbContext db, IDbTargetContext dbTarget) : ControllerBase
 {
-    /// <summary>GET, so it is served from a read replica. Nothing to declare.</summary>
+    /// <summary>GET, so the verb convention enabled in Program.cs serves it from a replica.</summary>
     [HttpGet]
     public async Task<IReadOnlyList<Order>> List()
         => await db.Orders.OrderByDescending(o => o.CreatedAt).Take(50).ToListAsync();
 
-    /// <summary>POST, so it goes to the master. Also nothing to declare.</summary>
+    /// <summary>POST, so the verb convention sends it to the master.</summary>
     [HttpPost]
     public async Task<ActionResult<Order>> Create(Order order)
     {
