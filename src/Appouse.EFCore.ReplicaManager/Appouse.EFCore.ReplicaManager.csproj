@@ -18,7 +18,7 @@
 
   <PropertyGroup>
     <PackageId>Appouse.EFCore.ReplicaManager</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>Appouse</Authors>
     <Company>Appouse</Company>
     <Product>Appouse.EFCore.ReplicaManager</Product>
@@ -39,6 +39,9 @@
     <!-- SourceLink is in-box from the .NET 8 SDK onwards. Adding Microsoft.SourceLink.GitHub here
          would set SuppressImplicitGitSourceLink and actively disable it. -->
     <EnablePackageValidation>true</EnablePackageValidation>
+    <!-- Compares the public API against the last shipped version, so an accidental removal fails at
+         pack time rather than at a consumer's compile. -->
+    <PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>
   </PropertyGroup>
 
   <ItemGroup>

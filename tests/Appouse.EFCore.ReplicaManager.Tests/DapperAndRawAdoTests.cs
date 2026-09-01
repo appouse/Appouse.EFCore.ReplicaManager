@@ -144,4 +144,97 @@ public sealed class DapperAndRawAdoTests : IClassFixture<TwoDatabaseFixture>
 
         Assert.Equal("replica", source);
     }
+
+    /// <summary>
+    /// The helper hands Dapper a connection EF Core opened, so it carries the ambient target.
+    /// </summary>
+    [Fact]
+    public async Task OpenRoutedConnectionAsync_follows_the_ambient_target()
+    {
+        await using var provider = Build();
+        var target = provider.GetRequiredService<IDbTargetContext>();
+
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        using (target.UseReplicaDb())
+        {
+            await using var routed = await db.Database.OpenRoutedConnectionAsync();
+            Assert.Equal("replica", await routed.Connection.QuerySingleAsync<string>(Sql));
+        }
+
+        using (target.UseMasterDb())
+        {
+            await using var routed = await db.Database.OpenRoutedConnectionAsync();
+            Assert.Equal("master", await routed.Connection.QuerySingleAsync<string>(Sql));
+        }
+    }
+
+    /// <summary>
+    /// The whole point: the helper does not inherit the route left behind by an earlier EF query.
+    /// </summary>
+    [Fact]
+    public async Task OpenRoutedConnectionAsync_does_not_inherit_a_stale_route()
+    {
+        await using var provider = Build();
+        var target = provider.GetRequiredService<IDbTargetContext>();
+
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        using (target.UseReplicaDb())
+        {
+            Assert.Equal("replica", await db.Markers.OrderBy(m => m.Id).Select(m => m.Source).FirstAsync());
+        }
+
+        // Raw access here would still hit the replica; the helper re-routes.
+        await using var routed = await db.Database.OpenRoutedConnectionAsync();
+        Assert.Equal("master", await routed.Connection.QuerySingleAsync<string>(Sql));
+    }
+
+    [Fact]
+    public async Task Disposing_the_handle_returns_the_connection_to_the_context()
+    {
+        await using var provider = Build();
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        await using (var routed = await db.Database.OpenRoutedConnectionAsync())
+        {
+            Assert.Equal(ConnectionState.Open, routed.Connection.State);
+        }
+
+        Assert.Equal(ConnectionState.Closed, db.Database.GetDbConnection().State);
+    }
+
+    [Fact]
+    public async Task Disposing_the_handle_twice_is_a_no_op()
+    {
+        await using var provider = Build();
+        await using var scope = provider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        var routed = await db.Database.OpenRoutedConnectionAsync();
+        await routed.DisposeAsync();
+        await routed.DisposeAsync();
+        routed.Dispose();
+
+        Assert.Equal(ConnectionState.Closed, db.Database.GetDbConnection().State);
+    }
+
+    [Fact]
+    public void The_synchronous_helper_routes_too()
+    {
+        using var provider = Build();
+        var target = provider.GetRequiredService<IDbTargetContext>();
+
+        using var scope = provider.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+
+        using (target.UseReplicaDb())
+        {
+            using var routed = db.Database.OpenRoutedConnection();
+            Assert.Equal("replica", routed.Connection.QuerySingle<string>(Sql));
+        }
+    }
 }

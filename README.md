@@ -393,6 +393,7 @@ object steps outside that, and the results are worth knowing before you rely on 
 
 | What you write | Routed? |
 |---|---|
+| `db.Database.OpenRoutedConnectionAsync()` | ✔ routed, with failover |
 | `db.Database.OpenConnectionAsync()`, then Dapper on `GetDbConnection()` | ✔ routed, with failover |
 | `db.Database.GetDbConnection()`, then `Open()` yourself | ✘ not routed |
 | `db.Database.GetDbConnection()`, then Dapper (which opens it for you) | ✘ not routed |
@@ -415,23 +416,29 @@ using (dbTarget.UseReplicaDb())
 await db.Database.GetDbConnection().ExecuteAsync("INSERT INTO ...");   // goes to the replica
 ```
 
-**Do this instead.** Let EF Core open it, then hand the connection to Dapper:
+**Do this instead.** `OpenRoutedConnectionAsync()` lets EF Core open the connection — which routes
+it — and lends it to you until the `using` ends:
 
 ```csharp
-await db.Database.OpenConnectionAsync();     // routed, and fails over between replicas
-try
-{
-    var orders = await db.Database.GetDbConnection().QueryAsync<Order>("SELECT ...");
-}
-finally
-{
-    await db.Database.CloseConnectionAsync();
-}
+await using var routed = await db.Database.OpenRoutedConnectionAsync(cancellationToken);
+
+var orders = await routed.Connection.QueryAsync<Order>("SELECT * FROM Orders WHERE ...");
 ```
 
-This goes through EF Core's connection pipeline, so it gets the ambient target, replica failover and
-health tracking exactly as an EF query would. Use `CloseConnectionAsync()` rather than closing the
-connection directly — EF Core reference-counts it.
+There is a synchronous `OpenRoutedConnection()` too. Both go through EF Core's connection pipeline,
+so they get the ambient target, replica failover and replica health tracking exactly as an EF query
+would — including re-routing away from whatever the previous query left on the connection.
+
+Disposing the handle returns the connection to the context rather than closing it directly, because
+EF Core reference-counts it. Disposing twice is a no-op.
+
+The long form is equivalent, if you would rather not take the handle:
+
+```csharp
+await db.Database.OpenConnectionAsync();
+try   { /* Dapper on db.Database.GetDbConnection() */ }
+finally { await db.Database.CloseConnectionAsync(); }
+```
 
 A connection you construct yourself, rather than taking from a `DbContext`, is outside this package
 entirely: resolve `IDbConnectionStringResolver` and choose the string explicitly.
