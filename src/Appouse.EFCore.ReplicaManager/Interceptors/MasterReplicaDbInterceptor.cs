@@ -179,6 +179,15 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
     /// </summary>
     internal IDbTargetContext TargetContext => _targetContext;
 
+    /// <summary>Supplies the master and replica connection strings. Reached by the probe extension.</summary>
+    internal IDbConnectionStringResolver Resolver => _resolver;
+
+    /// <summary>Tracks replica availability. Reached by the probe extension so a probe updates it.</summary>
+    internal IReplicaHealthMonitor Health => _health;
+
+    /// <summary>The configured options. Reached by the probe extension for the validation statement.</summary>
+    internal MasterReplicaOptions Options => _options;
+
     /// <inheritdoc />
     public override InterceptionResult ConnectionOpening(
         DbConnection connection,
@@ -213,6 +222,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
             {
                 connection.ConnectionString = replicas[index];
                 connection.Open();
+                ValidateIfRequested(connection, eventData, index);
                 _health.ReportSuccess(index);
                 _routes.RecordReplica(connection, index);
                 Log.OpenedReplica(_logger, eventData.ConnectionId, index);
@@ -268,6 +278,7 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
             {
                 connection.ConnectionString = replicas[index];
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+                await ValidateIfRequestedAsync(connection, eventData, index, cancellationToken).ConfigureAwait(false);
                 _health.ReportSuccess(index);
                 _routes.RecordReplica(connection, index);
                 Log.OpenedReplica(_logger, eventData.ConnectionId, index);
@@ -352,6 +363,76 @@ public sealed class MasterReplicaDbInterceptor : DbConnectionInterceptor
                 yield return index;
             }
         }
+    }
+
+    /// <summary>
+    /// Proves the connection actually reaches the server, rather than merely having been handed back
+    /// by the pool. Runs inside the failover loop's try block on purpose: a failure here is a replica
+    /// failure like any other, and moves the loop on to the next node.
+    /// <para>
+    /// TR: Bağlantının havuzdan geri verilmiş olmakla kalmayıp sunucuya gerçekten ulaştığını
+    /// kanıtlar. Bilinçli olarak failover döngüsünün try bloğu içinde çalışır: buradaki bir hata da
+    /// diğerleri gibi bir replica hatasıdır ve döngüyü bir sonraki düğüme taşır.
+    /// </para>
+    /// </summary>
+    private void ValidateIfRequested(DbConnection connection, ConnectionEventData eventData, int replicaIndex)
+    {
+        if (!_options.ValidateReplicaConnections)
+        {
+            return;
+        }
+
+        try
+        {
+            using var command = connection.CreateCommand();
+            PrepareValidationCommand(command, eventData);
+            command.ExecuteScalar();
+        }
+        catch (Exception exception)
+        {
+            Log.ReplicaValidationFailed(_logger, replicaIndex, eventData.ConnectionId, exception);
+            throw;
+        }
+    }
+
+    /// <inheritdoc cref="ValidateIfRequested" />
+    private async Task ValidateIfRequestedAsync(
+        DbConnection connection,
+        ConnectionEventData eventData,
+        int replicaIndex,
+        CancellationToken cancellationToken)
+    {
+        if (!_options.ValidateReplicaConnections)
+        {
+            return;
+        }
+
+        try
+        {
+            await using var command = connection.CreateCommand();
+            PrepareValidationCommand(command, eventData);
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Log.ReplicaValidationFailed(_logger, replicaIndex, eventData.ConnectionId, exception);
+            throw;
+        }
+    }
+
+    private void PrepareValidationCommand(DbCommand command, ConnectionEventData eventData)
+    {
+        command.CommandText = ReplicaValidationQuery.For(
+            _options.ReplicaValidationQuery,
+            eventData.Context?.Database.ProviderName);
+
+        // A replica that accepts connections but answers nothing holds the request open, which is
+        // worse than one that is plainly down.
+        command.CommandTimeout = Math.Max(1, (int)_options.ReplicaValidationTimeout.TotalSeconds);
     }
 
     private void RecordReplicaFailure(

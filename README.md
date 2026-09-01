@@ -135,27 +135,58 @@ options.ReplicaConnectionStrings.Add("...replica-3...");
 
 Writes are never failed over, because there is only one master to write to.
 
-### The one case failover cannot cover on its own
+### Proving a replica is really there
 
 Opening a connection is not the same as reaching a server. ADO.NET pools connections, so when a
 replica dies while the pool still holds warm handles to it, `OpenAsync` hands one back **without a
 network round trip and reports success**. The socket is dead, but nothing discovers that until the
 first command runs — far too late to pick a different replica for that attempt.
 
+A one-row query forces the round trip while the interceptor is still choosing a replica:
+
+```csharp
+options.ValidateReplicaConnections = true;      // off by default
+```
+
+With it on, a dead node is skipped inside the failover loop and **the application never sees an
+error**. With it off, the first request after an outage surfaces one connection error, the replica is
+taken out of rotation, and everything after that lands on the survivor. Both behaviours are covered
+by the live tests, on every provider.
+
+The cost is one extra round trip per replica connection, and EF Core opens a connection per
+operation — a real price on a busy read path, which is why it is opt-in. `ReplicaValidationQuery`
+defaults to `SELECT 1`, or `SELECT 1 FROM DUAL` on Oracle, and
+`ReplicaValidationTimeout` (5 seconds) bounds a replica that accepts connections but answers nothing.
+
+Two more things help when validation is off:
+
 * A command failing on a connection routed to a replica marks that replica down immediately, so the
   *next* request avoids it instead of drawing another dead handle from the same pool.
-* The failed command is not retried here — that is EF Core's execution strategy's job.
-* **Enable that strategy.** The retry opens a fresh connection, which routes away from the node
-  already marked down.
+* **Enable EF Core's retrying execution strategy.** The retry opens a fresh connection, which routes
+  away from the node already marked down, so the outage stays invisible without paying for
+  validation on every read.
 
 ```csharp
 builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
     options.UseNpgsql(cs, npgsql => npgsql.EnableRetryOnFailure(maxRetryCount: 5)));
 ```
 
-With retry enabled a replica outage is invisible to application code. Without it, the first request
-after the outage surfaces one connection error before traffic settles on the survivor. Both are
-covered by the live tests.
+### Asking, on demand
+
+`ProbeReplicasAsync()` answers "is every replica actually reachable right now?" — one connection and
+one query per replica, run concurrently, without touching the context's own connection:
+
+```csharp
+foreach (var result in await db.Database.ProbeReplicasAsync(cancellationToken))
+{
+    Console.WriteLine(result.IsReachable
+        ? $"replica #{result.ReplicaIndex}: up in {result.Duration.TotalMilliseconds:N0} ms"
+        : $"replica #{result.ReplicaIndex}: DOWN — {result.Error}");
+}
+```
+
+Results feed the health monitor, so a probe on a schedule — or from a health check endpoint — keeps
+routing away from a node that is down without waiting for a request to fail on it.
 
 `ReplicaUnavailableException` is deliberately not transient: every replica was dialled and refused,
 so retrying cannot help until one comes back.
@@ -387,6 +418,9 @@ using (dbTarget.UseMasterDb())
 | `ForceMasterOnSaveChanges` | `true` | `SaveChanges` always uses the master. |
 | `StickToMasterAfterSaveChanges` | `true` | Read-after-write consistency within the scope. |
 | `AllowReplicaFallbackToMaster` | `true` | Use the master when no replica answers. |
+| `ValidateReplicaConnections` | **`false`** | Prove each replica connection with a one-row query before use. |
+| `ReplicaValidationQuery` | *(auto)* | `SELECT 1`, or `SELECT 1 FROM DUAL` on Oracle. |
+| `ReplicaValidationTimeout` | `5s` | How long that query may take. |
 | `ReplicaFailureCooldown` | `30s` | How long a failed replica is stood down. |
 | `ValidateStartupWiring` | `true` | Fail fast on a context or a web app that was never wired up. |
 | `UnroutedDbContextTypes` | empty | Contexts deliberately left unrouted. |

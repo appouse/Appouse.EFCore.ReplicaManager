@@ -18,7 +18,7 @@
 
   <PropertyGroup>
     <PackageId>Appouse.EFCore.ReplicaManager</PackageId>
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <Authors>Appouse</Authors>
     <Company>Appouse</Company>
     <Product>Appouse.EFCore.ReplicaManager</Product>
@@ -41,7 +41,7 @@
     <EnablePackageValidation>true</EnablePackageValidation>
     <!-- Compares the public API against the last shipped version, so an accidental removal fails at
          pack time rather than at a consumer's compile. -->
-    <PackageValidationBaselineVersion>1.0.0</PackageValidationBaselineVersion>
+    <PackageValidationBaselineVersion>2.0.0</PackageValidationBaselineVersion>
   </PropertyGroup>
 
   <ItemGroup>

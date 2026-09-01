@@ -68,6 +68,12 @@ internal static partial class Log
     internal static partial void FallingBackToMaster(ILogger logger, int replicaCount, Guid connectionId);
 
     [LoggerMessage(
+        EventId = 1011,
+        Level = LogLevel.Warning,
+        Message = "Replica #{ReplicaIndex} accepted connection {ConnectionId} but failed its validation query, so the connection was live only in name; failing over to the next replica.")]
+    internal static partial void ReplicaValidationFailed(ILogger logger, int replicaIndex, Guid connectionId, Exception exception);
+
+    [LoggerMessage(
         EventId = 1010,
         Level = LogLevel.Warning,
         Message = "Controllers are registered but neither services.AddDbTargetMvcFilter() nor app.UseDbTargetRouting() was called, so no request is routed by attribute or HTTP verb and every action falls back to the configured default target. Add one of them, or set MasterReplicaOptions.ValidateStartupWiring to false if routing only through UseTarget scopes is intended.")]

@@ -215,6 +215,84 @@ public sealed class MasterReplicaOptions
     public TimeSpan ReplicaFailureCooldown { get; set; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// When <see langword="true"/>, a replica connection is proved live with a one-row query before
+    /// it is handed to EF Core. <strong>Off by default.</strong>
+    /// <para>
+    /// TR: <see langword="true"/> ise, bir replica bağlantısı EF Core'a verilmeden önce tek satırlık
+    /// bir sorguyla canlı olduğu kanıtlanır. <strong>Varsayılan olarak kapalıdır.</strong>
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This closes the one gap failover cannot cover on its own. ADO.NET pools connections, so when a
+    /// replica dies while the pool still holds warm handles to it, opening one succeeds without a
+    /// network round trip - the socket is dead, but nothing discovers that until the first real
+    /// command, far too late to choose a different replica. A validation query forces the round trip
+    /// while the interceptor is still inside its failover loop, so the dead node is skipped and the
+    /// application never sees an error.
+    /// </para>
+    /// <para>
+    /// TR: Bu, failover'ın tek başına kapatamadığı tek açığı kapatır. ADO.NET bağlantıları havuzlar;
+    /// bir replica, havuz hâlâ ona ait sıcak tutamaçlar tutarken çökerse bağlantı açmak ağ turu
+    /// yapmadan başarılı olur - soket ölüdür ama bunu ilk gerçek komut çalışana kadar kimse fark
+    /// etmez, ki başka bir replica seçmek için çok geçtir. Doğrulama sorgusu bu turu, interceptor
+    /// hâlâ failover döngüsündeyken zorlar; böylece ölü düğüm atlanır ve uygulama hiç hata görmez.
+    /// </para>
+    /// <para>
+    /// The cost is one extra round trip per replica connection, and EF Core opens a connection per
+    /// operation, so this is a real price on a busy read path. Off by default for that reason: leave
+    /// it off and a dead replica costs one failed request before being taken out of rotation; turn it
+    /// on and it costs nothing but latency on every read.
+    /// </para>
+    /// <para>
+    /// TR: Bedeli, replica bağlantısı başına fazladan bir ağ turudur ve EF Core her işlem için bir
+    /// bağlantı açar; yani yoğun bir okuma yolunda bu gerçek bir maliyettir. Varsayılan olarak kapalı
+    /// olmasının sebebi budur: kapalı bırakırsanız ölü bir replica, rotasyondan çıkarılmadan önce bir
+    /// başarısız isteğe mal olur; açarsanız her okumada yalnızca gecikmeye mal olur.
+    /// </para>
+    /// </remarks>
+    public bool ValidateReplicaConnections { get; set; }
+
+    /// <summary>
+    /// The statement used by <see cref="ValidateReplicaConnections"/> and by
+    /// <c>Database.ProbeReplicasAsync()</c>. Leave <see langword="null"/> to let the provider decide.
+    /// <para>
+    /// TR: <see cref="ValidateReplicaConnections"/> ve <c>Database.ProbeReplicasAsync()</c>
+    /// tarafından kullanılan ifade. Sağlayıcının karar vermesi için <see langword="null"/> bırakın.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// The default is <c>SELECT 1</c>, except on Oracle, which has no bare <c>SELECT</c> and gets
+    /// <c>SELECT 1 FROM DUAL</c>. Set it explicitly if your replicas are behind a proxy that needs a
+    /// particular statement, or if you want the probe to test something more than reachability.
+    /// <para>
+    /// TR: Varsayılanı <c>SELECT 1</c>'dir; çıplak <c>SELECT</c> kabul etmeyen Oracle hariç, orada
+    /// <c>SELECT 1 FROM DUAL</c> kullanılır. Replica'larınız belirli bir ifade bekleyen bir proxy
+    /// arkasındaysa veya sondanın erişilebilirlikten fazlasını sınamasını istiyorsanız açıkça
+    /// belirtin.
+    /// </para>
+    /// </remarks>
+    public string? ReplicaValidationQuery { get; set; }
+
+    /// <summary>
+    /// How long the validation query may take before the replica counts as unreachable. Defaults to
+    /// five seconds.
+    /// <para>
+    /// TR: Doğrulama sorgusunun, replica erişilemez sayılmadan önce ne kadar sürebileceği.
+    /// Varsayılanı beş saniyedir.
+    /// </para>
+    /// </summary>
+    /// <remarks>
+    /// A replica that accepts connections but answers nothing is worse than one that is plainly
+    /// down, because it holds the request open. This bounds that.
+    /// <para>
+    /// TR: Bağlantı kabul edip hiçbir şey yanıtlamayan bir replica, açıkça çökmüş olandan daha
+    /// kötüdür; çünkü isteği açık tutar. Bu ayar onu sınırlar.
+    /// </para>
+    /// </remarks>
+    public TimeSpan ReplicaValidationTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
     /// When <see langword="true"/> (the default), the host checks at start-up that the package is
     /// actually wired into the application, instead of silently doing nothing.
     /// <para>

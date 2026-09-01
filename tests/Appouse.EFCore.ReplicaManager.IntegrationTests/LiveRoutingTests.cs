@@ -244,6 +244,71 @@ public abstract class LiveRoutingTests<TCluster> : IClassFixture<TCluster>
         Assert.Contains(LiveClusterFixture.FirstReplicaSource, seen);
     }
 
+
+    /// <summary>
+    /// The gap failover cannot close on its own: a replica that dies while ADO.NET still holds warm
+    /// pooled handles hands one back from OpenAsync without a network round trip, so the first read
+    /// after the outage still fails. A validation query forces that round trip while the interceptor
+    /// is still choosing a replica, so the dead node is skipped and nothing reaches the application.
+    /// </summary>
+    [DockerFact]
+    public async Task With_validation_enabled_a_dead_replica_never_surfaces_an_error()
+    {
+        await using var provider = Build(options => options.ValidateReplicaConnections = true);
+
+        // Warm the pool against both replicas, so the outage happens under load.
+        await SourcesAsync(provider, 6);
+
+        Docker.Stop(Cluster.FirstReplicaContainer);
+        try
+        {
+            // No tolerance for failures here: every single read must succeed, unlike the same
+            // scenario without validation.
+            var seen = await SourcesAsync(provider, 8);
+            Assert.All(seen, s => Assert.Equal(LiveClusterFixture.SecondReplicaSource, s));
+        }
+        finally
+        {
+            Docker.Start(Cluster.FirstReplicaContainer);
+            await WaitUntilReachableAsync(Cluster.FirstReplicaConnectionString, TimeSpan.FromSeconds(60));
+        }
+    }
+
+    [DockerFact]
+    public async Task Probing_reports_which_replicas_are_really_there()
+    {
+        await using var provider = Build();
+
+        await using (var scope = provider.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+            var healthy = await db.Database.ProbeReplicasAsync();
+
+            Assert.Equal(2, healthy.Count);
+            Assert.All(healthy, r => Assert.True(r.IsReachable, r.Error));
+        }
+
+        Docker.Stop(Cluster.FirstReplicaContainer);
+        try
+        {
+            await using var scope = provider.CreateAsyncScope();
+            var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
+            var afterOutage = await db.Database.ProbeReplicasAsync();
+
+            Assert.False(afterOutage[0].IsReachable);
+            Assert.False(string.IsNullOrWhiteSpace(afterOutage[0].Error));
+            Assert.True(afterOutage[1].IsReachable);
+
+            // And the probe took the dead node out of rotation without waiting for a request to fail.
+            Assert.False(provider.GetRequiredService<IReplicaHealthMonitor>().IsAvailable(0));
+        }
+        finally
+        {
+            Docker.Start(Cluster.FirstReplicaContainer);
+            await WaitUntilReachableAsync(Cluster.FirstReplicaConnectionString, TimeSpan.FromSeconds(60));
+        }
+    }
+
     [DockerFact]
     public async Task SaveChanges_reaches_the_master_from_inside_a_replica_scope()
     {

@@ -1,8 +1,12 @@
 using System;
+using System.Collections.Generic;
+using System.Data.Common;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Appouse.EFCore.ReplicaManager;
+using Appouse.EFCore.ReplicaManager.Internal;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 
 namespace Microsoft.EntityFrameworkCore;
@@ -258,6 +262,149 @@ public static class ReplicaManagerDatabaseFacadeExtensions
     }
 
     /// <summary>
+    /// Asks every configured replica whether it is really there, by opening a connection to it and
+    /// running a one-row query.
+    /// <para>
+    /// TR: Yapılandırılmış her replica'ya gerçekten orada olup olmadığını sorar: bağlantı açar ve tek
+    /// satırlık bir sorgu çalıştırır.
+    /// </para>
+    /// </summary>
+    /// <param name="database">
+    /// The context's database facade, used only to learn the provider.
+    /// <para>TR: Yalnızca sağlayıcıyı öğrenmek için kullanılan context veritabanı arayüzü.</para>
+    /// </param>
+    /// <param name="cancellationToken">
+    /// Cancels the probe.
+    /// <para>TR: Sondayı iptal eder.</para>
+    /// </param>
+    /// <returns>
+    /// One result per configured replica, in configuration order. Empty when no replica is
+    /// configured.
+    /// <para>
+    /// TR: Yapılandırma sırasına göre her replica için bir sonuç. Hiç replica tanımlı değilse boş.
+    /// </para>
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="database"/> is <see langword="null"/>.
+    /// <para>TR: <paramref name="database"/> <see langword="null"/>.</para>
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// This <c>DbContext</c> was registered without master/replica splitting.
+    /// <para>TR: Bu <c>DbContext</c> master/replica ayrımı olmadan kaydedilmiş.</para>
+    /// </exception>
+    /// <remarks>
+    /// <para>
+    /// Opening alone does not prove anything: ADO.NET pools connections, so a handle to a server that
+    /// has since died is handed back without a network round trip. The query is what forces the round
+    /// trip, and it is why <see cref="ReplicaProbeResult.IsReachable"/> means both halves succeeded.
+    /// </para>
+    /// <para>
+    /// TR: Yalnızca açmak hiçbir şey kanıtlamaz: ADO.NET bağlantıları havuzlar, bu yüzden o sırada
+    /// çökmüş bir sunucuya ait tutamaç ağ turu yapılmadan geri verilir. Turu zorlayan şey sorgudur;
+    /// <see cref="ReplicaProbeResult.IsReachable"/> özelliğinin iki yarının da başarılı olduğu
+    /// anlamına gelmesinin sebebi de budur.
+    /// </para>
+    /// <para>
+    /// The probe uses its own connections and never touches the context's, so it is safe to call at
+    /// any time. Its results feed <see cref="IReplicaHealthMonitor"/>: a replica that answers has its
+    /// cooldown cleared, and one that does not is stood down, so a scheduled probe doubles as a way
+    /// to keep routing away from a node that is down.
+    /// </para>
+    /// <para>
+    /// TR: Sonda kendi bağlantılarını kullanır ve context'inkine hiç dokunmaz; bu yüzden her an
+    /// çağrılabilir. Sonuçları <see cref="IReplicaHealthMonitor"/> bileşenini besler: yanıt veren bir
+    /// replica'nın bekleme süresi temizlenir, vermeyen dinlendirilir. Böylece zamanlanmış bir sonda,
+    /// yönlendirmeyi çökmüş bir düğümden uzak tutmanın da bir yolu olur.
+    /// </para>
+    /// <para>
+    /// Replicas are probed concurrently, so one unreachable node does not delay the rest.
+    /// </para>
+    /// <para>
+    /// TR: Replica'lar eşzamanlı sondalanır; böylece erişilemeyen bir düğüm diğerlerini geciktirmez.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// foreach (var result in await db.Database.ProbeReplicasAsync(cancellationToken))
+    /// {
+    ///     Console.WriteLine(result.IsReachable
+    ///         ? $"replica #{result.ReplicaIndex}: up in {result.Duration.TotalMilliseconds:N0} ms"
+    ///         : $"replica #{result.ReplicaIndex}: DOWN - {result.Error}");
+    /// }
+    /// </code>
+    /// </example>
+    public static async Task<IReadOnlyList<ReplicaProbeResult>> ProbeReplicasAsync(
+        this DatabaseFacade database,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(database);
+
+        var interceptor = RequireInterceptor(database);
+        var replicas = interceptor.Resolver.GetReplicaConnectionStrings();
+
+        if (replicas.Count == 0)
+        {
+            return Array.Empty<ReplicaProbeResult>();
+        }
+
+        // Cloned from the context's own connection, so the probe stays provider-agnostic.
+        var factory = DbProviderFactories.GetFactory(database.GetDbConnection())
+            ?? throw new InvalidOperationException(
+                "The database provider did not expose a DbProviderFactory, so replicas cannot be probed " +
+                "with connections of their own. Query the replicas directly instead, or enable " +
+                $"{nameof(MasterReplicaOptions)}.{nameof(MasterReplicaOptions.ValidateReplicaConnections)} " +
+                "so every replica connection is validated as it is opened.");
+        var sql = ReplicaValidationQuery.For(interceptor.Options.ReplicaValidationQuery, database.ProviderName);
+        var timeout = Math.Max(1, (int)interceptor.Options.ReplicaValidationTimeout.TotalSeconds);
+
+        var probes = new Task<ReplicaProbeResult>[replicas.Count];
+        for (var i = 0; i < replicas.Count; i++)
+        {
+            probes[i] = ProbeOneAsync(factory, replicas[i], i, sql, timeout, interceptor.Health, cancellationToken);
+        }
+
+        return await Task.WhenAll(probes).ConfigureAwait(false);
+    }
+
+    private static async Task<ReplicaProbeResult> ProbeOneAsync(
+        DbProviderFactory factory,
+        string connectionString,
+        int replicaIndex,
+        string sql,
+        int timeoutSeconds,
+        IReplicaHealthMonitor health,
+        CancellationToken cancellationToken)
+    {
+        var start = Stopwatch.GetTimestamp();
+
+        try
+        {
+            await using var connection = factory.CreateConnection()
+                ?? throw new InvalidOperationException("The provider factory returned no connection.");
+
+            connection.ConnectionString = connectionString;
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.CommandTimeout = timeoutSeconds;
+            await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+
+            health.ReportSuccess(replicaIndex);
+            return new ReplicaProbeResult(replicaIndex, isReachable: true, Stopwatch.GetElapsedTime(start), error: null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            health.ReportFailure(replicaIndex, exception);
+            return new ReplicaProbeResult(replicaIndex, isReachable: false, Stopwatch.GetElapsedTime(start), exception.Message);
+        }
+    }
+
+    /// <summary>
     /// Finds the ambient target store by locating this context's own routing interceptor, which also
     /// proves the context is actually wired for master/replica splitting.
     /// <para>
@@ -275,6 +422,11 @@ public static class ReplicaManagerDatabaseFacadeExtensions
     /// </returns>
     private static IDbTargetContext RequireTargetContext(DatabaseFacade database)
     {
+        return RequireInterceptor(database).TargetContext;
+    }
+
+    private static MasterReplicaDbInterceptor RequireInterceptor(DatabaseFacade database)
+    {
         var interceptor = database
             .GetService<IDbContextOptions>()
             .FindExtension<CoreOptionsExtension>()?
@@ -282,7 +434,7 @@ public static class ReplicaManagerDatabaseFacadeExtensions
             .OfType<MasterReplicaDbInterceptor>()
             .FirstOrDefault();
 
-        return interceptor?.TargetContext
+        return interceptor
                ?? throw new InvalidOperationException(
                    "This DbContext was registered without master/replica splitting, so a target cannot be " +
                    "applied to it. Register it with services.AddMasterReplicaDbContext<TContext>(...), or, if " +

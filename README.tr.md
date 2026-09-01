@@ -136,27 +136,58 @@ options.ReplicaConnectionStrings.Add("...replica-3...");
 
 Yazmalar asla failover edilmez, çünkü yazılacak tek bir master vardır.
 
-### Failover'ın tek başına kapatamadığı durum
+### Bir replica'nın gerçekten orada olduğunu kanıtlamak
 
-Bağlantı açmak, sunucuya erişmekle aynı şey değildir. ADO.NET bağlantıları havuzlar; bu yüzden bir
-replica, havuz hâlâ ona ait sıcak tutamaçlar tutarken çökerse `OpenAsync` bunlardan birini **ağ turu
-yapmadan geri verir ve başarı bildirir**. Soket ölüdür ama bunu ilk komut çalışana kadar kimse fark
-etmez — o deneme için başka bir replica seçmek için çok geçtir.
+Bağlantı açmak, sunucuya erişmekle aynı şey değildir. ADO.NET bağlantıları havuzlar; bir replica,
+havuz hâlâ ona ait sıcak tutamaçlar tutarken çökerse `OpenAsync` bunlardan birini **ağ turu yapmadan
+geri verir ve başarı bildirir**. Soket ölüdür ama bunu ilk komut çalışana kadar kimse fark etmez — o
+deneme için başka bir replica seçmek için çok geçtir.
+
+Tek satırlık bir sorgu, interceptor hâlâ replica seçerken bu turu zorlar:
+
+```csharp
+options.ValidateReplicaConnections = true;      // varsayılan olarak kapalı
+```
+
+Açıkken ölü düğüm failover döngüsünün içinde atlanır ve **uygulama hiç hata görmez**. Kapalıyken
+kesintiden sonraki ilk istek bir bağlantı hatası verir, replica rotasyondan çıkarılır ve sonraki her
+şey hayatta kalana düşer. İki davranış da canlı testlerle, her sağlayıcıda kapsanır.
+
+Bedeli, replica bağlantısı başına fazladan bir ağ turudur ve EF Core her işlem için bir bağlantı açar
+— yoğun bir okuma yolunda bu gerçek bir maliyettir; opt-in olmasının sebebi budur.
+`ReplicaValidationQuery` varsayılanı `SELECT 1`, Oracle'da `SELECT 1 FROM DUAL`'dir;
+`ReplicaValidationTimeout` (5 saniye) ise bağlantı kabul edip hiçbir şey yanıtlamayan bir replica'yı
+sınırlar.
+
+Doğrulama kapalıyken iki şey daha yardımcı olur:
 
 * Bir replica'ya yönlendirilmiş bağlantıda komut hata verirse o replica anında düşmüş işaretlenir;
-  böylece **sonraki** istek aynı havuzdan bir ölü tutamaç daha çekmek yerine o düğümden kaçınır.
-* Başarısız komut burada yeniden denenmez — o, EF Core'un yürütme stratejisinin işidir.
-* **O stratejiyi açın.** Yeniden deneme yeni bir bağlantı açar ve çoktan düşmüş işaretlenmiş
-  düğümden kaçınarak yönlendirilir.
+  böylece **sonraki** istek aynı havuzdan bir ölü tutamaç daha çekmez.
+* **EF Core'un yeniden deneyen yürütme stratejisini açın.** Yeniden deneme yeni bir bağlantı açar ve
+  çoktan düşmüş işaretlenmiş düğümden kaçınır; böylece her okumada doğrulama maliyetini ödemeden
+  kesinti görünmez kalır.
 
 ```csharp
 builder.Services.AddMasterReplicaDbContext<AppDbContext>((options, cs) =>
     options.UseNpgsql(cs, npgsql => npgsql.EnableRetryOnFailure(maxRetryCount: 5)));
 ```
 
-Retry açıkken bir replica kesintisi uygulama kodundan tamamen görünmez. Kapalıyken kesintiden sonraki
-ilk istek bir bağlantı hatası verir, ardından trafik hayatta kalana oturur. İkisi de canlı testlerle
-kapsanır.
+### İstediğiniz an sormak
+
+`ProbeReplicasAsync()`, "şu anda her replica gerçekten erişilebilir mi?" sorusunu cevaplar — replica
+başına bir bağlantı ve bir sorgu, eşzamanlı çalışır ve context'in kendi bağlantısına hiç dokunmaz:
+
+```csharp
+foreach (var result in await db.Database.ProbeReplicasAsync(cancellationToken))
+{
+    Console.WriteLine(result.IsReachable
+        ? $"replica #{result.ReplicaIndex}: ayakta, {result.Duration.TotalMilliseconds:N0} ms"
+        : $"replica #{result.ReplicaIndex}: ERİŞİLEMİYOR — {result.Error}");
+}
+```
+
+Sonuçlar sağlık izleyicisini besler; bu yüzden zamanlanmış bir sonda — ya da bir health check
+endpoint'i — bir isteğin o düğümde hata vermesini beklemeden yönlendirmeyi ondan uzak tutar.
 
 `ReplicaUnavailableException` bilinçli olarak geçici (transient) değildir: tüm replica'lar arandı ve
 reddetti demektir, biri geri gelene kadar yeniden denemek fayda etmez.
@@ -387,6 +418,9 @@ using (dbTarget.UseMasterDb())
 | `ForceMasterOnSaveChanges` | `true` | `SaveChanges` her zaman master kullanır. |
 | `StickToMasterAfterSaveChanges` | `true` | Scope içinde yazma sonrası okuma tutarlılığı. |
 | `AllowReplicaFallbackToMaster` | `true` | Hiçbir replica yanıt vermezse master'ı kullanır. |
+| `ValidateReplicaConnections` | **`false`** | Her replica bağlantısını kullanmadan önce tek satırlık sorguyla kanıtlar. |
+| `ReplicaValidationQuery` | *(otomatik)* | `SELECT 1`, Oracle'da `SELECT 1 FROM DUAL`. |
+| `ReplicaValidationTimeout` | `5 sn` | O sorgunun ne kadar sürebileceği. |
 | `ReplicaFailureCooldown` | `30 sn` | Başarısız bir replica'nın ne kadar dinlendirileceği. |
 | `ValidateStartupWiring` | `true` | Hiç bağlanmamış bir context veya web uygulaması için erken hata. |
 | `UnroutedDbContextTypes` | boş | Bilinçli olarak yönlendirilmemiş context'ler. |
