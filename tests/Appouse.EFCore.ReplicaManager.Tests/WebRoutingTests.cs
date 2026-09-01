@@ -19,28 +19,28 @@ public sealed class MarkersController(MarkerContext db) : ControllerBase
     public Task<string> Post() => Source(db);
 
     [HttpGet("forced-write")]
-    [UseWriteDb]
+    [UseMasterDb]
     public Task<string> ForcedWrite() => Source(db);
 
     [HttpPost("forced-read")]
-    [UseReadDb]
+    [UseReplicaDb]
     public Task<string> ForcedRead() => Source(db);
 
     internal static Task<string> Source(MarkerContext context)
         => context.Markers.OrderBy(m => m.Id).Select(m => m.Source).FirstAsync();
 }
 
-/// <summary>Every handler here inherits the controller-level <c>[UseReadDb]</c>.</summary>
+/// <summary>Every handler here inherits the controller-level <c>[UseReplicaDb]</c>.</summary>
 [ApiController]
 [Route("api/reporting")]
-[UseReadDb]
+[UseReplicaDb]
 public sealed class ReportingController(MarkerContext db) : ControllerBase
 {
     [HttpPost("inherited")]
     public Task<string> Inherited() => MarkersController.Source(db);
 
     [HttpPost("overridden")]
-    [UseWriteDb]
+    [UseMasterDb]
     public Task<string> Overridden() => MarkersController.Source(db);
 }
 
@@ -60,22 +60,22 @@ public sealed class WebRoutingTests : IClassFixture<TwoDatabaseFixture>, IAsyncL
         builder.Services.AddControllers().AddApplicationPart(typeof(MarkersController).Assembly);
         builder.Services.AddDbTargetMvcFilter();
 
-        builder.Services.AddEfCoreReadWriteSplit(options =>
+        builder.Services.AddEfCoreMasterReplica(options =>
         {
-            options.WriteConnectionString = _fx.MasterConnectionString;
-            options.ReadConnectionString = _fx.ReplicaConnectionString;
+            options.MasterConnectionString = _fx.MasterConnectionString;
+            options.ReplicaConnectionString = _fx.ReplicaConnectionString;
         });
-        builder.Services.AddReadWriteDbContext<MarkerContext>((options, cs) => options.UseSqlite(cs));
+        builder.Services.AddMasterReplicaDbContext<MarkerContext>((options, cs) => options.UseSqlite(cs));
 
         _app = builder.Build();
 
         _app.MapControllers();
         _app.MapGet("/minimal/get", (MarkerContext db) => MarkersController.Source(db));
         _app.MapPost("/minimal/post", (MarkerContext db) => MarkersController.Source(db));
-        _app.MapGet("/minimal/forced-write", (MarkerContext db) => MarkersController.Source(db)).UseWriteDb();
-        _app.MapPost("/minimal/forced-read", (MarkerContext db) => MarkersController.Source(db)).UseReadDb();
+        _app.MapGet("/minimal/forced-write", (MarkerContext db) => MarkersController.Source(db)).UseMasterDb();
+        _app.MapPost("/minimal/forced-read", (MarkerContext db) => MarkersController.Source(db)).UseReplicaDb();
 
-        var group = _app.MapGroup("/minimal/group").UseReadDb();
+        var group = _app.MapGroup("/minimal/group").UseReplicaDb();
         group.MapPost("/inherited", (MarkerContext db) => MarkersController.Source(db));
 
         await _app.StartAsync();
@@ -125,7 +125,7 @@ public sealed class WebRoutingTests : IClassFixture<TwoDatabaseFixture>, IAsyncL
     /// <summary>
     /// This app wires only the MVC filter. A Minimal API endpoint that carries neither an
     /// attribute helper nor the middleware is therefore never pinned, and correctly falls back to
-    /// <see cref="ReadWriteOptions.DefaultTarget"/> - which defaults to the master. Add
+    /// <see cref="MasterReplicaOptions.DefaultTarget"/> - which defaults to the master. Add
     /// <c>app.UseDbTargetRouting()</c> to apply the verb convention to Minimal APIs as well; that
     /// configuration is covered by <see cref="MiddlewareRoutingTests"/>.
     /// </summary>

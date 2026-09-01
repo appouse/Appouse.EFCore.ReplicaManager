@@ -26,12 +26,12 @@ public sealed class MiddlewareRoutingTests : IClassFixture<TwoDatabaseFixture>, 
 
         builder.Services.AddControllers().AddApplicationPart(typeof(MarkersController).Assembly);
 
-        builder.Services.AddEfCoreReadWriteSplit(options =>
+        builder.Services.AddEfCoreMasterReplica(options =>
         {
-            options.WriteConnectionString = _fx.MasterConnectionString;
-            options.ReadConnectionString = _fx.ReplicaConnectionString;
+            options.MasterConnectionString = _fx.MasterConnectionString;
+            options.ReplicaConnectionString = _fx.ReplicaConnectionString;
         });
-        builder.Services.AddReadWriteDbContext<MarkerContext>((options, cs) => options.UseSqlite(cs));
+        builder.Services.AddMasterReplicaDbContext<MarkerContext>((options, cs) => options.UseSqlite(cs));
 
         _app = builder.Build();
 
@@ -41,7 +41,7 @@ public sealed class MiddlewareRoutingTests : IClassFixture<TwoDatabaseFixture>, 
         _app.MapControllers();
         _app.MapGet("/minimal/get", (MarkerContext db) => MarkersController.Source(db));
         _app.MapPost("/minimal/post", (MarkerContext db) => MarkersController.Source(db));
-        _app.MapGet("/minimal/forced-write", (MarkerContext db) => MarkersController.Source(db)).UseWriteDb();
+        _app.MapGet("/minimal/forced-write", (MarkerContext db) => MarkersController.Source(db)).UseMasterDb();
 
         await _app.StartAsync();
         _client = _app.GetTestClient();

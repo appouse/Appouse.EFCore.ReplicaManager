@@ -5,46 +5,57 @@ using Microsoft.Extensions.Options;
 namespace Appouse.EFCore.ReplicaManager;
 
 /// <summary>
-/// Default <see cref="IDbConnectionStringResolver"/>: serves the master connection string for
-/// <see cref="DbTarget.WriteMaster"/> and delegates replica choice to
-/// <see cref="IReadReplicaSelector"/> for <see cref="DbTarget.ReadReplica"/>.
+/// Default <see cref="IDbConnectionStringResolver"/>: serves the connection strings configured in
+/// <see cref="MasterReplicaOptions"/>.
+/// <para>
+/// TR: Varsayılan <see cref="IDbConnectionStringResolver"/> uygulaması:
+/// <see cref="MasterReplicaOptions"/> içinde tanımlanan bağlantı dizelerini sunar.
+/// </para>
 /// </summary>
 /// <remarks>
-/// The replica list is materialised once at construction time -
-/// <see cref="ReadWriteOptions.ReadConnectionString"/> first, then every non-blank entry of
-/// <see cref="ReadWriteOptions.ReadConnectionStrings"/> - so resolving a connection string on the
-/// hot path allocates nothing.
+/// The replica list is materialised once at construction -
+/// <see cref="MasterReplicaOptions.ReplicaConnectionString"/> first, then every non-blank entry of
+/// <see cref="MasterReplicaOptions.ReplicaConnectionStrings"/> - so its order and length are stable,
+/// which is what lets <see cref="IReplicaHealthMonitor"/> track availability by index.
+/// <para>
+/// TR: Replica listesi kurulum anında bir kez oluşturulur - önce
+/// <see cref="MasterReplicaOptions.ReplicaConnectionString"/>, ardından
+/// <see cref="MasterReplicaOptions.ReplicaConnectionStrings"/> içindeki boş olmayan her kayıt.
+/// Böylece sırası ve uzunluğu sabit kalır; <see cref="IReplicaHealthMonitor"/>'ın erişilebilirliği
+/// indekse göre izleyebilmesini sağlayan da budur.
+/// </para>
 /// </remarks>
 public sealed class DbConnectionStringResolver : IDbConnectionStringResolver
 {
-    private readonly bool _allowFallbackToWrite;
-    private readonly IReadOnlyList<string> _replicas;
-    private readonly IReadReplicaSelector _selector;
-    private readonly string _writeConnectionString;
+    private readonly string _masterConnectionString;
+    private readonly IReadOnlyList<string> _replicaConnectionStrings;
 
     /// <summary>
     /// Creates a resolver over the configured connection strings.
+    /// <para>TR: Yapılandırılmış bağlantı dizeleri üzerinde bir çözümleyici oluşturur.</para>
     /// </summary>
-    /// <param name="options">The configured read/write splitting options.</param>
-    /// <param name="selector">Strategy used to pick between multiple replicas.</param>
-    /// <exception cref="ArgumentNullException">Any argument is <see langword="null"/>.</exception>
-    public DbConnectionStringResolver(IOptions<ReadWriteOptions> options, IReadReplicaSelector selector)
+    /// <param name="options">
+    /// The configured master/replica options.
+    /// <para>TR: Yapılandırılmış master/replica ayarları.</para>
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="options"/> is <see langword="null"/>.
+    /// <para>TR: <paramref name="options"/> <see langword="null"/>.</para>
+    /// </exception>
+    public DbConnectionStringResolver(IOptions<MasterReplicaOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);
-        ArgumentNullException.ThrowIfNull(selector);
 
         var value = options.Value;
-        _selector = selector;
-        _writeConnectionString = value.WriteConnectionString;
-        _allowFallbackToWrite = value.AllowReadFallbackToWrite;
+        _masterConnectionString = value.MasterConnectionString;
 
-        var replicas = new List<string>(value.ReadConnectionStrings.Count + 1);
-        if (!string.IsNullOrWhiteSpace(value.ReadConnectionString))
+        var replicas = new List<string>(value.ReplicaConnectionStrings.Count + 1);
+        if (!string.IsNullOrWhiteSpace(value.ReplicaConnectionString))
         {
-            replicas.Add(value.ReadConnectionString);
+            replicas.Add(value.ReplicaConnectionString);
         }
 
-        foreach (var connectionString in value.ReadConnectionStrings)
+        foreach (var connectionString in value.ReplicaConnectionStrings)
         {
             if (!string.IsNullOrWhiteSpace(connectionString))
             {
@@ -52,37 +63,12 @@ public sealed class DbConnectionStringResolver : IDbConnectionStringResolver
             }
         }
 
-        _replicas = replicas;
+        _replicaConnectionStrings = replicas;
     }
 
     /// <inheritdoc />
-    /// <exception cref="InvalidOperationException">
-    /// A replica was requested, none is configured, and
-    /// <see cref="ReadWriteOptions.AllowReadFallbackToWrite"/> is disabled.
-    /// </exception>
-    public string Resolve(DbTarget target)
-    {
-        if (target == DbTarget.WriteMaster)
-        {
-            return _writeConnectionString;
-        }
+    public string GetMasterConnectionString() => _masterConnectionString;
 
-        if (_replicas.Count == 0)
-        {
-            return _allowFallbackToWrite
-                ? _writeConnectionString
-                : throw new InvalidOperationException(
-                    $"{DbTarget.ReadReplica} was requested but no replica connection string is configured. " +
-                    $"Set {nameof(ReadWriteOptions)}.{nameof(ReadWriteOptions.ReadConnectionString)}, or enable " +
-                    $"{nameof(ReadWriteOptions)}.{nameof(ReadWriteOptions.AllowReadFallbackToWrite)}.");
-        }
-
-        if (_replicas.Count == 1)
-        {
-            return _replicas[0];
-        }
-
-        var selected = _selector.Select(_replicas);
-        return string.IsNullOrWhiteSpace(selected) ? _replicas[0] : selected;
-    }
+    /// <inheritdoc />
+    public IReadOnlyList<string> GetReplicaConnectionStrings() => _replicaConnectionStrings;
 }

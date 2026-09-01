@@ -29,13 +29,13 @@ public sealed class OrdersController(AppDbContext db, IDbTargetContext dbTarget)
 
     /// <summary>A GET that must not observe replication lag: pin it to the master.</summary>
     [HttpGet("{id:int}")]
-    [UseWriteDb]
+    [UseMasterDb]
     public async Task<ActionResult<Order>> Get(int id)
         => await db.Orders.FindAsync(id) is { } order ? order : NotFound();
 
     /// <summary>A POST that only reads: let a replica carry the load.</summary>
     [HttpPost("search")]
-    [UseReadDb]
+    [UseReplicaDb]
     public async Task<IReadOnlyList<Order>> Search(string customer)
         => await db.Orders.Where(o => o.Customer == customer).ToListAsync();
 
@@ -46,7 +46,7 @@ public sealed class OrdersController(AppDbContext db, IDbTargetContext dbTarget)
     [HttpGet("{id:int}/receipt")]
     public async Task<ActionResult<Order>> Receipt(int id)
     {
-        using (dbTarget.UseWriteDb())
+        using (dbTarget.UseMasterDb())
         {
             return await db.Orders.FindAsync(id) is { } order ? order : NotFound();
         }

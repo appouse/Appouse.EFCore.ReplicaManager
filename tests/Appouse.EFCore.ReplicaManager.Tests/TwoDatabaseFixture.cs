@@ -29,6 +29,14 @@ public sealed class TwoDatabaseFixture : IDisposable
 
     public string SecondReplicaConnectionString { get; }
 
+    /// <summary>
+    /// Points at a database that cannot be opened: the directory does not exist and the connection
+    /// asks for ReadWrite rather than ReadWriteCreate, so SQLite refuses instead of creating a file.
+    /// This is how a downed replica is simulated.
+    /// </summary>
+    public static string UnreachableConnectionString { get; } =
+        "Data Source=/appouse-replica-manager-no-such-directory/replica.db;Mode=ReadWrite";
+
     public DbContextOptions<MarkerContext> OptionsFor(string connectionString)
         => new DbContextOptionsBuilder<MarkerContext>().UseSqlite(connectionString).Options;
 

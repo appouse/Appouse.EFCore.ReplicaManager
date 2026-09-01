@@ -57,7 +57,7 @@ public sealed class SettlementWorker(
 
         // 1. The heavy scan is lag-tolerant, so keep it off the master.
         List<int> candidates;
-        using (dbTarget.UseReadDb())
+        using (dbTarget.UseReplicaDb())
         {
             candidates = await db.Orders
                 .Where(o => !o.Settled && o.CreatedAt < DateTimeOffset.UtcNow.AddHours(-1))
@@ -73,7 +73,7 @@ public sealed class SettlementWorker(
         }
 
         // 2. Re-read and update on the master, where the rows are authoritative.
-        using (dbTarget.UseWriteDb())
+        using (dbTarget.UseMasterDb())
         {
             var orders = await db.Orders
                 .Where(o => candidates.Contains(o.Id) && !o.Settled)

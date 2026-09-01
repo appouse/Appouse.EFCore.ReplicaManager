@@ -18,16 +18,16 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
 
     public RoutingTests(TwoDatabaseFixture fx) => _fx = fx;
 
-    private ServiceProvider BuildProvider(Action<ReadWriteOptions>? configure = null)
+    private ServiceProvider BuildProvider(Action<MasterReplicaOptions>? configure = null)
     {
         var services = new ServiceCollection();
-        services.AddEfCoreReadWriteSplit(options =>
+        services.AddEfCoreMasterReplica(options =>
         {
-            options.WriteConnectionString = _fx.MasterConnectionString;
-            options.ReadConnectionString = _fx.ReplicaConnectionString;
+            options.MasterConnectionString = _fx.MasterConnectionString;
+            options.ReplicaConnectionString = _fx.ReplicaConnectionString;
             configure?.Invoke(options);
         });
-        services.AddReadWriteDbContext<MarkerContext>((options, connectionString) => options.UseSqlite(connectionString));
+        services.AddMasterReplicaDbContext<MarkerContext>((options, connectionString) => options.UseSqlite(connectionString));
         return services.BuildServiceProvider();
     }
 
@@ -65,7 +65,7 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     [Fact]
     public async Task DefaultTarget_option_routes_to_the_replica()
     {
-        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.ReadReplica);
+        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.Replica);
         Assert.Equal("replica", await ReadSourceAsync(provider));
     }
 
@@ -77,7 +77,7 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
 
         Assert.Equal("master", await ReadSourceAsync(provider));
 
-        using (target.UseTarget(DbTarget.ReadReplica))
+        using (target.UseTarget(DbTarget.Replica))
         {
             Assert.Equal("replica", await ReadSourceAsync(provider));
         }
@@ -91,15 +91,15 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
         await using var provider = BuildProvider();
         var target = provider.GetRequiredService<IDbTargetContext>();
 
-        using (target.UseReadDb())
+        using (target.UseReplicaDb())
         {
             Assert.Equal("replica", await ReadSourceAsync(provider));
 
-            using (target.UseWriteDb())
+            using (target.UseMasterDb())
             {
                 Assert.Equal("master", await ReadSourceAsync(provider));
 
-                using (target.UseReadDb())
+                using (target.UseReplicaDb())
                 {
                     Assert.Equal("replica", await ReadSourceAsync(provider));
                 }
@@ -119,17 +119,17 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
         using var provider = BuildProvider();
         var target = provider.GetRequiredService<IDbTargetContext>();
 
-        var outer = target.UseTarget(DbTarget.ReadReplica);
-        var inner = target.UseTarget(DbTarget.WriteMaster);
+        var outer = target.UseTarget(DbTarget.Replica);
+        var inner = target.UseTarget(DbTarget.Master);
 
         inner.Dispose();
         inner.Dispose();
         inner.Dispose();
 
-        Assert.Equal(DbTarget.ReadReplica, target.CurrentTarget);
+        Assert.Equal(DbTarget.Replica, target.CurrentTarget);
 
         outer.Dispose();
-        Assert.Equal(DbTarget.WriteMaster, target.CurrentTarget);
+        Assert.Equal(DbTarget.Master, target.CurrentTarget);
     }
 
     [Fact]
@@ -149,24 +149,24 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
 
         var results = await Task.WhenAll(
             Enumerable.Range(0, 24).Select(i =>
-                i % 2 == 0 ? ReadUnder(DbTarget.ReadReplica, 5 + (i % 7)) : ReadUnder(DbTarget.WriteMaster, 5 + (i % 5))));
+                i % 2 == 0 ? ReadUnder(DbTarget.Replica, 5 + (i % 7)) : ReadUnder(DbTarget.Master, 5 + (i % 5))));
 
         for (var i = 0; i < results.Length; i++)
         {
             Assert.Equal(i % 2 == 0 ? "replica" : "master", results[i]);
         }
 
-        Assert.Equal(DbTarget.WriteMaster, target.CurrentTarget);
+        Assert.Equal(DbTarget.Master, target.CurrentTarget);
     }
 
     [Fact]
-    public async Task SaveChanges_is_forced_onto_the_master_even_inside_a_read_scope()
+    public async Task SaveChanges_is_forced_onto_the_master_even_inside_a_replica_scope()
     {
-        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.ReadReplica);
+        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.Replica);
         var target = provider.GetRequiredService<IDbTargetContext>();
         var written = $"written-{Guid.NewGuid():N}";
 
-        using (target.UseTarget(DbTarget.ReadReplica))
+        using (target.UseTarget(DbTarget.Replica))
         {
             await using var scope = provider.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
@@ -181,10 +181,10 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     [Fact]
     public async Task Reads_after_a_write_stick_to_the_master_for_the_rest_of_the_scope()
     {
-        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.ReadReplica);
+        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.Replica);
         var target = provider.GetRequiredService<IDbTargetContext>();
 
-        using (target.UseTarget(DbTarget.ReadReplica))
+        using (target.UseTarget(DbTarget.Replica))
         {
             Assert.Equal("replica", await ReadSourceAsync(provider));
 
@@ -197,12 +197,12 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
 
             // The write pinned the master, and the pin is visible to this caller because the
             // ambient holder is mutated in place rather than reassigned.
-            Assert.Equal(DbTarget.WriteMaster, target.CurrentTarget);
+            Assert.Equal(DbTarget.Master, target.CurrentTarget);
             Assert.Equal("master", await ReadSourceAsync(provider));
         }
 
         // ...and the pin dies with the scope.
-        Assert.Equal(DbTarget.ReadReplica, target.CurrentTarget);
+        Assert.Equal(DbTarget.Replica, target.CurrentTarget);
     }
 
     [Fact]
@@ -210,12 +210,12 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     {
         await using var provider = BuildProvider(o =>
         {
-            o.DefaultTarget = DbTarget.ReadReplica;
-            o.StickToWriteAfterSaveChanges = false;
+            o.DefaultTarget = DbTarget.Replica;
+            o.StickToMasterAfterSaveChanges = false;
         });
         var target = provider.GetRequiredService<IDbTargetContext>();
 
-        using (target.UseTarget(DbTarget.ReadReplica))
+        using (target.UseTarget(DbTarget.Replica))
         {
             await using (var scope = provider.CreateAsyncScope())
             {
@@ -224,7 +224,7 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
                 await db.SaveChangesAsync();
             }
 
-            Assert.Equal(DbTarget.ReadReplica, target.CurrentTarget);
+            Assert.Equal(DbTarget.Replica, target.CurrentTarget);
             Assert.Equal("replica", await ReadSourceAsync(provider));
         }
     }
@@ -232,11 +232,11 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     [Fact]
     public async Task An_explicit_transaction_started_inside_a_write_scope_reaches_the_master()
     {
-        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.ReadReplica);
+        await using var provider = BuildProvider(o => o.DefaultTarget = DbTarget.Replica);
         var target = provider.GetRequiredService<IDbTargetContext>();
         var written = $"tx-{Guid.NewGuid():N}";
 
-        using (target.UseWriteDb())
+        using (target.UseMasterDb())
         {
             await using var scope = provider.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<MarkerContext>();
@@ -254,14 +254,14 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     public async Task Multiple_replicas_are_used_round_robin()
     {
         var services = new ServiceCollection();
-        services.AddEfCoreReadWriteSplit(options =>
+        services.AddEfCoreMasterReplica(options =>
         {
-            options.WriteConnectionString = _fx.MasterConnectionString;
-            options.ReadConnectionString = _fx.ReplicaConnectionString;
-            options.ReadConnectionStrings.Add(_fx.SecondReplicaConnectionString);
-            options.DefaultTarget = DbTarget.ReadReplica;
+            options.MasterConnectionString = _fx.MasterConnectionString;
+            options.ReplicaConnectionString = _fx.ReplicaConnectionString;
+            options.ReplicaConnectionStrings.Add(_fx.SecondReplicaConnectionString);
+            options.DefaultTarget = DbTarget.Replica;
         });
-        services.AddReadWriteDbContext<MarkerContext>((options, connectionString) => options.UseSqlite(connectionString));
+        services.AddMasterReplicaDbContext<MarkerContext>((options, connectionString) => options.UseSqlite(connectionString));
 
         await using var provider = services.BuildServiceProvider();
 
@@ -280,17 +280,17 @@ public sealed class RoutingTests : IClassFixture<TwoDatabaseFixture>
     public void Misconfiguration_stops_the_host_at_start_up()
     {
         var builder = Host.CreateApplicationBuilder();
-        builder.Services.AddEfCoreReadWriteSplit(options =>
+        builder.Services.AddEfCoreMasterReplica(options =>
         {
-            options.WriteConnectionString = string.Empty;
-            options.ReadConnectionString = string.Empty;
+            options.MasterConnectionString = string.Empty;
+            options.ReplicaConnectionString = string.Empty;
         });
 
         using var host = builder.Build();
 
         var error = Assert.Throws<OptionsValidationException>(() => host.Start());
-        Assert.Contains(nameof(ReadWriteOptions.WriteConnectionString), error.Message, StringComparison.Ordinal);
-        Assert.Contains(nameof(ReadWriteOptions.ReadConnectionString), error.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(MasterReplicaOptions.MasterConnectionString), error.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(MasterReplicaOptions.ReplicaConnectionString), error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
